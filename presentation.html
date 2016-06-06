@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Title</title>
+    <meta charset="utf-8">
+    <style>
+      @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+      @import url(https://fonts.googleapis.com/css?family=Abel);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu);
+      @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+      body { font-family: 'sans-serif'; background-color: black;}
+      h1, h2, h3 {
+        font-family: 'Abel';
+        font-weight: normal;
+      }
+      .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono'; }
+
+      .small-caps { font-variant: small-caps }
+
+      /* Thanks to http://www.partage-it.com/animez-vos-presentations-remark-js/  (in French) */
+      .remark-fading { z-index: 9; }
+      .remark-slide-container {transition: opacity 0.5s ease-out; opacity: 0;}
+      .remark-visible {transition: opacity 0.5s ease-out; opacity: 1;}
+    </style>
+  </head>
+  <body>
+    <textarea id="source">
+
+class: center, middle
+
+# Heisenbug
+
+--
+
+*/ˈhaɪzənˌbʌɡ/ (n)* A bug that disappears or alters its behavior when one attempts to probe or isolate it.
+
+*- The Jargon File*
+
+???
+
+So. How did it start?
+
+---
+
+name: agenda
+class: exampleclass
+
+# Agenda
+
+1. Introduction
+2. Deep-dive
+
+.a-class[text with a class]
+
+```elixir
+defmodule Foo do
+  function(foo, :bar) # comment
+end
+```
+
+???
+some notes
+some more notes
+
+---
+
+# .small-caps[It started] with a 500 on a dev server
+
+```sh
+$ curl http://eu-west-1-a-dev-translator-realtime.ably.io/nonexistantpath -v
+
+< HTTP/1.1 500 Internal Server Error
+* Server Cowboy is not blacklisted
+< server: Cowboy
+```
+
+???
+
+So tell me, what's the first step?
+
+...
+
+Right, check the logs for that machine, seems like a plan. Elixir has good logs.
+
+---
+
+# The logfile:
+
+--
+
+```sh
+
+```
+
+???
+
+Uh. It's empty.
+
+Well, ok, I'm exaggerating a bit. It had some log statements from app startup, but since then, nothing.
+
+This shouldn't be possible. I had log level set to debug; all requests had least one log message, and anything which causes a 500 generally had several (an error logs and a crash trace or two). Why would the logfile be showing nothing?
+
+Ideas?
+
+...
+
+I figured maybe there was some sort of output buffering thing happening in production mode that I'd just never noticed before, so the log messages were there but just not getting flushed to stdout?
+
+I had a look through the docs for logger, but couldn't find any options related to syncing stdout or anything like that. But I figured, maybe I just need to fill the buffer.
+
+So I curl'd a whole bunch more times, and tried again. And:
+
+---
+
+# woah
+
+```erlang
+=INFO REPORT====
+    application: logger
+    exited: shutdown
+    type: permanent
+
+=ERROR REPORT====
+Error in process <0.438.0> with exit value:
+{[{reason,undef},
+  {mfa,{'Elixir.AppName.Web.CatchAll',handle,2}},
+  {stacktrace,
+      [{'Elixir.Inspect.List',inspect,
+           [[],
+            #{'__struct__' => 'Elixir.Inspect.Opts',
+              base => decimal,
+              binaries => infer,
+              char_lists => infer,
+              limit => 50,
+              pretty => false,
+              safe => true,
+              structs => true,
+              width => 80}],
+           []},
+       {'Elixir.Kernel',inspect,2,[{file,"lib/kernel.ex"},{line,1566}]},
+       {'Elixir.AppName.Web.CatchAll',handle,2,
+           [{file,"lib/web/catch_all.ex"},{line,11}]},
+       {cowboy_handler,handler_handle,4,
+           [{file,"src/cowboy_handler.erl"},{line,111}]},
+       {cowboy_protocol,execute,4,
+           [{file,"src/cowboy_protocol.erl"},{line,442}]}]},
+  {req,
+      [{socket,#Port<0.8619>},
+       {transport,ranch_tcp},
+       {connection,keepalive},
+       {pid,<0.438.0>},
+       {method,<<"GET">>},
+       {version,'HTTP/1.1'},
+       {peer,{{172,17,0,1},40454}},
+       {host,<<"172.17.0.3">>},
+       {host_info,undefined},
+       {port,6100},
+       {path,<<"/badpagr">>},
+       {path_info,[<<"badpagr">>]},
+       {qs,<<>>},
+       {qs_vals,undefined},
+       {bindings,[]},
+       {headers,
+           [{<<"user-agent">>,<<"curl/7.35.0">>},
+            {<<"host">>,<<"172.17.0.3:6100">>},
+            {<<"accept">>,<<"*/*">>}]},
+       {p_headers,[]},
+       {cookies,undefined},
+       {meta,[]},
+       {body_state,waiting},
+       {buffer,<<>>},
+       {multipart,undefined},
+       {resp_compress,false},
+       {resp_state,waiting},
+       {resp_headers,[]},
+       {resp_body,<<>>},
+       {onresponse,undefined}]},
+  {state,nil}],
+ [{cowboy_protocol,execute,4,[{file,"src/cowboy_protocol.erl"},{line,442}]}]}
+```
+
+???
+
+Success! Er, sortof.
+
+What's going on here?
+
+[reads]
+
+Aha! the logger application's crashed!
+
+I guess that explains who logging started not working so well. The logger app must've been responsible for flushing stdout.
+
+OK, so why has logger crashed?
+
+The module and function it crashed in is the handle function of my catchall cowboy handler, the thing which requests go to when no other route matches them.
+
+And the reason is:
+
+"undef" - so a function's undefined,
+and that function is...
+"inspect", in the module Elixir.Inspect.List
+
+Wat?
+
+Let's look on - inspect was called with two arguments, an empty list -- which is the thing being inspected - and an opts map.
+
+Let's take a look at that line of my cowboy handler.
+
+---
+
+# the offending code (?)
+
+```elixir
+Logger.warn "Unknown path: #{:cowboy_req.path(request) |> elem(0)},
+  params: #{:cowboy_req.qs_vals(request) |> elem(0) |> inspect}"
+```
+
+--
+
+```elixir
+:cowboy_req.qs_vals(request) |> elem(0)`
+```
+
+???
+is just an empty_list, so this is equivalent to
+
+--
+
+```elixir
+inspect([])
+```
+
+???
+
+OK, so what's going on here? Inspect seems to work in general, one of the log lines I print at startup inspects a pid and an integer (a port number). Just... not for lists?
+
+And it's only happening in production. Never seen it on my local machine, never seen it in ci.
+
+I say production - to be clear, this is all happening on an aws instance in a cluster called 'dev'. We have various clusters - dev, staging, sandbox, and actual production. But as far as mix is concerned, all these environments are prod.
+
+So, next step: lets try and reproduce this on my local machine. What's different between prod and dev?
+
+---
+
+???
+
+Well, they have a different mix_env for a start.
+
+Could that make a difference? Maybe, yeah.
+
+I'm pretty sure I heard someone talking about elixir 'consolidating protocols' in production. I don't know what that means, but Inspect is a protocol, so, sounds plausible.
+
+So I compile and run the app with MIX_ENV=prod. And...
+
+---
+
+class: center, middle
+
+# 😞
+
+???
+
+Nope. Still doesn't happen locally.
+
+That's me being sad.
+
+OK, time to get serious!
+
+---
+
+class: center, middle
+
+# 😠
+
+???
+
+That's me being serious.
+
+    </textarea>
+    <script src="remark-latest.min.js">
+    </script>
+    <script>
+      var slideshow = remark.create();
+    </script>
+  </body>
+</html>
