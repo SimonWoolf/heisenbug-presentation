@@ -19,10 +19,15 @@
 
       .small-caps { font-variant: small-caps }
 
+      .small { font-size: 70%; }
+
       /* Thanks to http://www.partage-it.com/animez-vos-presentations-remark-js/  (in French) */
       .remark-fading { z-index: 9; }
       .remark-slide-container {transition: opacity 0.5s ease-out; opacity: 0;}
       .remark-visible {transition: opacity 0.5s ease-out; opacity: 1;}
+
+      .ably > img { width: 80%; }
+      .lmars > img { width: 40%; }
     </style>
   </head>
   <body>
@@ -32,41 +37,25 @@ class: center, middle
 
 # Heisenbug
 
---
-
 */ˈhaɪzənˌbʌɡ/ (n)* A bug that disappears or alters its behavior when one attempts to probe or isolate it.
 
 *- The Jargon File*
 
+## Simon Woolf .small[&nbsp;&nbsp; simon@ably.io &nbsp;&nbsp; github.com/simonwoolf]
+
+--
+
+--
+
 ???
+
+Hi. I'm Simon, and this is a talk about a bug.
 
 So. How did it start?
 
 ---
 
-name: agenda
-class: exampleclass
-
-# Agenda
-
-1. Introduction
-2. Deep-dive
-
-.a-class[text with a class]
-
-```elixir
-defmodule Foo do
-  function(foo, :bar) # comment
-end
-```
-
-???
-some notes
-some more notes
-
----
-
-# .small-caps[It started] with a 500 on a dev server
+# .small-caps[It started] with a 500
 
 ```sh
 $ curl http://eu-west-1-a-dev-translator-realtime.ably.io/nonexistantpath -v
@@ -78,17 +67,13 @@ $ curl http://eu-west-1-a-dev-translator-realtime.ably.io/nonexistantpath -v
 
 ???
 
-So tell me, what's the first step?
+It started with a 500 error when getting an unknown path, on a staging server. Which shouldn't happen; I have a catchall cowboy handler that serves a nice 404.
 
-...
-
-Right, check the logs for that machine, seems like a plan. Elixir has good logs.
+First step: check the logs for that machine. Here's the logfile:
 
 ---
 
 # The logfile:
-
---
 
 ```sh
 
@@ -98,19 +83,14 @@ Right, check the logs for that machine, seems like a plan. Elixir has good logs.
 
 Uh. It's empty.
 
-Well, ok, I'm exaggerating a bit. It had some log statements from app startup, but since then, nothing.
+Well, ok, it had some log statements from app startup.
+But since then, nothing.
 
-This shouldn't be possible. I had log level set to debug; all requests had least one log message, and anything which causes a 500 generally had several (an error logs and a crash trace or two). Why would the logfile be showing nothing?
+This shouldn't be possible. Anything which causes a 500 usually prints an error log and a crash trace or two.
 
-Ideas?
+Maybe there's some sort of stdout buffering that only happens in production mode?
 
-...
-
-I figured maybe there was some sort of output buffering thing happening in production mode that I'd just never noticed before, so the log messages were there but just not getting flushed to stdout?
-
-I had a look through the docs for logger, but couldn't find any options related to syncing stdout or anything like that. But I figured, maybe I just need to fill the buffer.
-
-So I curl'd a whole bunch more times, and tried again. And:
+I had a look through the docs for logger, but couldn't find anything relevant. But I figure, maybe if I do the same thing a bunch more times I'll get something. And:
 
 ---
 
@@ -183,31 +163,28 @@ Error in process <0.438.0> with exit value:
 
 ???
 
-Success! Er, sortof.
+Success! ...sortof.
 
 What's going on here?
 
-[reads]
+"application: logger,
+exited: shutdown".
+the logger's crashed!
 
-Aha! the logger application's crashed!
+I guess that explains why logging wasn't working too well.
 
-I guess that explains who logging started not working so well. The logger app must've been responsible for flushing stdout.
-
-OK, so why has logger crashed?
-
-The module and function it crashed in is the handle function of my catchall cowboy handler, the thing which requests go to when no other route matches them.
+OK, so, the module it crashed in my cowboy 404 handler.
 
 And the reason is:
 
-"undef" - so a function's undefined,
-and that function is...
+"undef" - a function's undefined, which was
 "inspect", in the module Elixir.Inspect.List
 
-Wat?
+being called with two arguments, an empty list -- the thing being inspected - and some options.
 
-Let's look on - inspect was called with two arguments, an empty list -- which is the thing being inspected - and an opts map.
+wat?
 
-Let's take a look at that line of my cowboy handler.
+Let's have a look at the line it crashed on:
 
 ---
 
@@ -218,14 +195,19 @@ Logger.warn "Unknown path: #{:cowboy_req.path(request) |> elem(0)},
   params: #{:cowboy_req.qs_vals(request) |> elem(0) |> inspect}"
 ```
 
+???
+
+Here it is. The stacktrace pointed to the second line, so the
+expression that crashed was:
+
 --
 
 ```elixir
-:cowboy_req.qs_vals(request) |> elem(0)`
+:cowboy_req.qs_vals(request) |> elem(0) |> inspect`
 ```
 
 ???
-is just an empty_list, so this is equivalent to
+which for this request was equivalent to
 
 --
 
@@ -235,25 +217,13 @@ inspect([])
 
 ???
 
-OK, so what's going on here? Inspect seems to work in general, one of the log lines I print at startup inspects a pid and an integer (a port number). Just... not for lists?
+inspecting an empty list.
 
-And it's only happening in production. Never seen it on my local machine, never seen it in ci.
+What's going on here? Inspect generally works, the things I log on startup inspect stuff. Just... not lists?
 
-I say production - to be clear, this is all happening on an aws instance in a cluster called 'dev'. We have various clusters - dev, staging, sandbox, and actual production. But as far as mix is concerned, all these environments are prod.
+And only happening in production, too (well - a staging cluster, not really production, but as far a mix is concerned, it's production). Never seen it on my local machine, never seen it in ci.
 
-So, next step: lets try and reproduce this on my local machine. What's different between prod and dev?
-
----
-
-???
-
-Well, they have a different mix_env for a start.
-
-Could that make a difference? Maybe, yeah.
-
-I'm pretty sure I heard someone talking about elixir 'consolidating protocols' in production. I don't know what that means, but Inspect is a protocol, so, sounds plausible.
-
-So I compile and run the app with MIX_ENV=prod. And...
+So what's different between prod and locally? I think I remember hearing someone talking about elixir 'consolidating protocols' in production. I don't really know what that means, but I think Inspect is a protocol, right? so lets try compiling and running locally with MIX_ENV=prod, and...
 
 ---
 
@@ -263,9 +233,7 @@ class: center, middle
 
 ???
 
-Nope. Still doesn't happen locally.
-
-That's me being sad.
+No luck.
 
 OK, time to get serious!
 
@@ -277,13 +245,192 @@ class: center, middle
 
 ???
 
-That's me being serious.
+(that's me being serious)
+
+Over some time and with a help from the Elixir community (including Jose, because Elixir), we worked out that:
+
+---
+
+# Debugging results
+
+```elixir
+:erlang.function_exported(Elixir.Inspect.List, :inspect, 2)
+# => true locally
+# => false in production
+```
+
+???
+
+Elixir.Inspect.List doesn't seem to be available as a function, but:
+
+--
+
+- The `Elixir.Inspect.List.beam` file is present and correct
+
+???
+
+The `Elixir.Inspect.List.beam` file is there in the slug -- I downloaded the slug and checked -- and it seems to have been compiled correctly. And
+
+---
+
+# Debugging results
+
+- Sometimes, `Code.ensure_loaded?(Elixir.Inspect.List)` returns `true`. In this case:
+ - Subsequent `function_exported(Elixir.Inspect.List, :inspect, 2)` calls return `true`
+ - all subsequent `inspect` calls work correctly (whether List, Map, whatever). (After a successful `inspect` of a type, the relevant `function_exported` calls start returning true)
+
+- Sometimes, `Code.ensure_loaded?(Elixir.Inspect.List)` returns `false`. In this case:
+ - all `function_exported(Elixir.Inspect.List, :inspect, 2)` calls continue to return `false`
+ - all subsequent `inspect` calls fail (or if done by Logger, crash logger)
+
+???
+
+Code.ensure_loaded just seems to behave completely randomly. And to be clear, this isn't just between builds, it's between deploys of a single build -- the same slug, the same compiled artifacts.
+
+---
+
+# Debugging results
+
+???
+
+[IF RUNNING OUT OF TIME]
+I'm running out of time, so I'll skip some more debugging -- short version, it seemed to depend on how soon after app startup inspect with an array was first called -- and get to...
+
+[ELSE]
+After some more experimentation, it looked like this problem was only ever happening if the very first call to `inspect` for some datatype was done *from a cowboy handler process*.
+
+So I could mitigate the problem by calling this:
+
+--
+
+```elixir
+Logger.debug "Some data structures: \
+#{inspect {%{}, [], MapSet.new, 0.1, 1..2, ~r//, :a, <<1>>}}"
+```
+
+???
+
+on app startup -- inspecting every datatype I could think of -- so that the first call to `inspect` with an array didn't happen in a cowboy handler. Which seemed to indicate that this was a bug in Erlang's code loader, which lead to all sorts of scary labels:
+
+--
+
+![scary labels](./scary-labels.png)
+
+???
+
+on a github Elixir issue.
+
+Eventually worked out that this was a bit of a red herring -- the reason that the code being in a cowboy handler made a difference was just because if it ran on app startup, it was running earlier. Being in a cowboy handler was irrelevant.
+
+I don't want to keep you all in suspense, so I'll jump to:
+
+---
+
+# The answer
+
+???
+
+The answer!
+
+---
+
+# The answer (tldr: it was our fault)
+
+???
+
+Firstly I should say it wasn't me who solved it -- this guy:
+
+---
+
+# The answer
+
+.lmars[![Lewis Marshall](./lmars.jpg)]
+
+### Lewis Marshall, who found the answer
+
+
+???
+
+Lewis, our head of infrastructure, who's awesome, solved it.
+
+A quick note about our deployment process:
+
+we were mounting complied slugs with overlayfs, which means any filesystem writes by the application don't change the actual slug. The upper (mutable) layer was in /tmp (in a directory unique to each docker container instance).
+
+Unrelatedly, we had a maintenance script that runs *immediately after a deploy completes*, that among other things:
+
+---
+
+# The answer
+
+```ruby
+if File.exists?('/tmp')
+  logger.info 'Cleaning up temp files older than 2 days'
+  warn 'Could not delete old temp files' unless system(
+    'sudo find /tmp -type f -mtime +2 -exec rm -f {} \;'
+  )
+end
+```
+
+???
+
+cleans up any files in /tmp with an mtime (last-modified time) of older than 2 day ago.
+
+You see where this is going.
+
+Since the things in /tmp are overlayfs upper directories, this cleanup script didn't change the actual slug, so whenever I looked at that, it was all correct. But it did mark files as 'deleted' in overlayfs, so they were hidden from the docker container.
+
+Result: sadness, depending mostly on whether a given BEAM file had already been loaded by the erlang vm at the time the cleanup script ran.
+
+(So the problem only showed up with inspect because all the other files and protocols were loaded and exercised earlier on, on app startup -- but, as it happens, not Inspect.List).
+
+---
+
+# Solution
+
+--
+
+```diff
+  def slug_volume(slug_path)
+    # use an overlayfs mount so that the container cannot change files in the
+    # underlying slug directory
+-   tmp = Dir.mktmpdir("slug-")
+-   run "sudo mount -t overlayfs \
+-     -o lowerdir=#{slug_path},upperdir=#{tmp} overlayfs #{tmp}"
++   FileUtils.mkdir_p "/slugs/mnt"
++   mnt = Dir.mktmpdir("slug-", "/slugs/mnt")
++   run "sudo mount -t overlayfs \
++     -o lowerdir=#{slug_path},upperdir=#{mnt} overlayfs #{mnt}"
+    {
+-     host:  tmp,
++     host:  mnt,
+      guest: "/app"
+    }
+  end
+```
+
+???
+
+Solution: move the overlayfs upper directories out of /tmp.
+
+---
+
+class: center, middle
+
+# Thank you
+
+### Simon Woolf
+
+### simon@ably.io &nbsp;&nbsp;&nbsp; github.com/simonwoolf
+
+.ably[![Default-aligned image](./ably-banner.png)]
+
 
     </textarea>
     <script src="remark-latest.min.js">
     </script>
     <script>
-      var slideshow = remark.create();
+      var slideshow = remark.create({highlightStyle: 'github'});
     </script>
   </body>
 </html>
