@@ -81,14 +81,11 @@ First step: check the logs for that machine. Here's the logfile:
 
 Uh. It's empty.
 
-Well, ok, it had some log statements from app startup.
-But since then, nothing.
-
 This shouldn't be possible. Anything which causes a 500 usually prints an error log and a crash trace or two.
 
 Maybe there's some sort of stdout buffering that only happens in production mode?
 
-I had a look through the docs for logger, but couldn't find anything relevant. But I figure, maybe if I do the same thing a bunch more times I'll get something. And:
+Maybe if I do the same thing a bunch more times I'll get something. And:
 
 ---
 
@@ -175,8 +172,7 @@ OK, so, the module it crashed in my cowboy 404 handler.
 
 And the reason is:
 
-"undef" - a function's undefined, which was
-"inspect", in the module Elixir.Inspect.List
+"undef" - a function's undefined, which was "inspect"
 
 being called with two arguments, an empty list -- the thing being inspected - and some options.
 
@@ -245,7 +241,7 @@ class: center, middle
 
 (that's me being serious)
 
-Over some time and with a help from the Elixir community (including Jose, because Elixir), we worked out that:
+Over some time and with help from the Elixir community, we worked out that:
 
 ---
 
@@ -283,7 +279,7 @@ The `Elixir.Inspect.List.beam` file is there in the slug -- I downloaded the slu
 
 ???
 
-Code.ensure_loaded just seems to behave completely randomly. And to be clear, this isn't just between builds, it's between deploys of a single build -- the same slug, the same compiled artifacts.
+Code.ensure_loaded -- which loads a module if it isn't already -- just seems to behave completely randomly. And to be clear, this isn't just between builds, it's between deploys of a single build -- the same slug, the same compiled artifacts.
 
 ---
 
@@ -292,7 +288,7 @@ Code.ensure_loaded just seems to behave completely randomly. And to be clear, th
 ???
 
 [IF RUNNING OUT OF TIME]
-I'm running out of time, so I'll skip some more debugging -- short version, it seemed to depend on how soon after app startup inspect with an array was first called -- and get to...
+I'm running out of time, so I'll skip some more debugging blind paths -- the short version is it seemed to depend on how soon after app startup inspect with an array was first called. And get to:
 
 [ELSE]
 After some more experimentation, it looked like this problem was only ever happening if the very first call to `inspect` for some datatype was done *from a cowboy handler process*.
