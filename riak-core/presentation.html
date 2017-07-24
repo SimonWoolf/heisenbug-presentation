@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Title</title>
+    <meta charset="utf-8">
+    <style>
+      @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+      @import url(https://fonts.googleapis.com/css?family=Abel);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu);
+      @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+      body { font-family: 'sans-serif'; background-color: black;}
+      h1, h2, h3 {
+        font-family: 'Abel';
+        font-weight: normal;
+      }
+      .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono'; }
+
+      .small-caps { font-variant: small-caps }
+
+      .small { font-size: 70%; }
+
+      .fade{ color: #aaa; }
+
+      .fittoslide > * { width: 100%; }
+
+      /* Thanks to http://www.partage-it.com/animez-vos-presentations-remark-js/  (in French) */
+      .remark-fading { z-index: 9; }
+      .remark-slide-container {transition: opacity 0.5s ease-out; opacity: 0;}
+      .remark-visible {transition: opacity 0.5s ease-out; opacity: 1;}
+
+      .ably > img { width: 40%; }
+    </style>
+  </head>
+  <body>
+    <textarea id="source">
+
+class: center, middle
+
+# How to build your own Ably with Riak Core
+
+.ably[![](./header_logo.svg)]
+
+## Simon Woolf .small[&nbsp;&nbsp; simon@ably.io &nbsp;&nbsp; github.com/simonwoolf]
+
+???
+
+remark.js shortcuts:
+p for presenter mode
+c to create a new synced window
+
+---
+
+???
+
+So: The first part of this talk isn't actually about Riak core. It's about how if you start thinking about how you'd design a system to solve a certain problem, in a way that scales, you might after a few iterations naturally end up at something that looks like Riak core.
+
+So, first things first, what is Ably? Ably is a Platform-as-a-service implementation of the pub-sub
+
+--
+
+# pubsub
+
+???
+
+i.e. 'publish-subscribe' pattern. Others inclde Pusher and PubNub.
+The pub-sub pattern is pretty simple:
+
+--
+
+![](./pubsub.png)
+
+???
+
+it's a messaging pattern where the sender is decoupled from receiver. A publisher publishes messages into topics, or 'channels', that subscribers can subscribe to. The publisher doesn't need to know how many subscribers there are, it's the same amount of work for them to publish to a channel with one subscriber or a million.
+
+Sounds simple enough. Sounds like a fun thing to build from scratch in Elixir. So, what are the basic approaches we can take?
+
+First the simplest and most obvious slash naive way: just keep all subscription state in a process
+
+---
+
+# approaches to pubsub in elixir
+
+1. keep subscription state in a process
+
+???
+
+Maybe
+
+--
+
+```elixir
+%{
+  "another_channel" => #MapSet<[#PID<0.57.0>]>,
+  "some_channel"    => #MapSet<[#PID<0.57.0>, #PID<0.66.0>]>
+}
+```
+
+???
+in GenServer state as a Map of channels to a Set of subscribers to those channels. or perhaps
+
+--
+
+
+```elixir
+# add a subscriber
+GenEvent.add_handler(event_manager, {EventHandler, pid}, {pid, channels})
+
+# emit an event
+def handle_event(message, state = {subscriber_pid, channels}) do
+  if message.channel in channels do
+    send(subscriber_pid, {:message, message})
+  end
+end
+```
+
+???
+
+with GenEvent, where each subscriber adds a genevent handler. A bit cleaner in some ways, but the overall effect is much the same, all information on who is subscribed to what channel is kept in one process.
+
+---
+
+### approach 1. keep subscription state in a process
+
+???
+
+The advantages of this approach is that
+
+--
+
+#### advantages:
+
+- linearisable message stream - consistent ordering, channel rules, channel outputs, etc.
+
+???
+
+Having one process makes things very simple. There's one point of synchronisation, so consistent message ordering just happens, and it's very easy to add additional rules, or filters, or extra outputs, or anything else -- there's only one place to put them.
+
+The disadvantages are:
+
+--
+
+#### disadvantages:
+
+- doesn't scale. at all
+
+???
+
+It doesn't scale. At all. That one process on one node is a bottleneck, everything goes through that.
+
+OK, so that's not ideal. So how can we make it better?
+
+One way to say, ok, so what if messages don't actually go *through* process, what if the process just stores subscriber info and the publisher process can query that when it wants to publish a message to a channel, find out who's subscribing to that channel, and do the publishing itself.
+
+Which is a fair point. So lets take that principle and say, well, if that's all it's doing, we can make it even better by not using a process at all, and instead using
+
+---
+
+# approaches to pubsub in elixir
+
+1. .fade[keep subscription state in a process]
+
+2. property-based process registration
+
+
+???
+
+ETS tables!
+
+Yeah, I know the slide says Property-based process registration, but under the hood, they're basically all ETS tables.
+The three most common ones are
+
+---
+
+### approach 2. property-based process registration
+
+a. the Elixir registry
+
+b. `gproc`
+
+c. PG2
+
+???
+
+the Elixir registry, gproc, and PG2.
+
+Quick reminder: the elixir registry can be used in either a mode where at most one process can register itself under a name, called 'unique' mode
+
+or where any number of processes can register themselves under a name, called 'duplicate' mode.
+
+'property-based' process registration is another name for this 'duplicate' mode.
+
+So the idea is that if a subscriber process wants to subscribe to channel "channelname", it
+
+---
+
+### approach 2. property-based process registration
+
+#### the Elixir Registry
+
+```elixir
+Registry.register(SubscriptionsRegistry, "channelname", null)
+```
+
+???
+
+registers itself to a registry in duplicate mode under the key 'channelname'. Then when a publisher wants to send a message to that channel, it can
+
+--
+
+```elixir
+Registry.dispatch(SubscriptionsRegistry, "channelname", fn (subscribers) ->
+  for {pid, _} <- entries, do: send(pid, message)
+end)
+```
+
+???
+
+use Registry.dispatch to the message to all the subscribers.
+
+Gproc offers even more different modes:
+
+---
+
+### approach 2. property-based process registration
+
+#### `gproc`
+
+'property', is non-unique, i.e. different processes can each register a property with the same name.
+
+'name', is unique within the given context (local or global).
+
+'counter', is similar to a property, but has a numeric value and behaves roughly as an ets counter (see update_counter/2.)
+
+'aggregated counter', is automatically updated by gproc, and reflects the sum of all counter objects with the same name in the given scope. The initial value for an aggregated counter must be undefined.
+
+'resource property', behaves like a property, but can be tracked with a 'resource counter'.
+
+'resource counter', tracks the number of resource properties with the same name. When the resource count reaches 0, any triggers specified using an on_zero attribute may be executed (see below).
+
+???
+
+with its 'property' mode corresponding to the Elixir registry's 'duplicate' mode, and its 'name' mode corresponding to the Elixir registry's 'unique' mode. So for the moment we're looking at 'property' mode.
+
+Finally we have PG2
+
+---
+
+### approach 2. property-based process registration
+
+#### PG2
+
+???
+
+PG stands for 'process groups'. This is an erlang builtin. and is one of the two backends that Phoenix PubSub can use. (The other one is admitting defeat and passing the problem onto redis, which is an approach I will speak no further of).
+
+So:
+
+---
+
+### approach 2. property-based process registration
+
+#### advantages:
+
+???
+
+The registry / gproc / process groups / ets tables approach
+
+--
+
+- On a single node, scales a lot better than option 1
+
+???
+
+Scales a lot better than the previous approach. All three property registries (especially the Elixir registry) make efficient use of ets tables to avoid bottlenecking.
+
+But there are some disadvantages:
+
+--
+
+#### Disadvantages:
+
+- no single point of synchronisation, so linearisability is harder
+
+???
+
+Since you no longer a single process that all messages for a channel flow through, it's less obvious under what circumstances message ordering is still guaranteed, and it's harder to do channel rules, filters, extra outputs, and so on. Still possible, but less trivial.
+
+--
+
+- distributed? ...sorta
+
+???
+
+So, we're using the beam, we want to scale out by adding more nodes to our mesh. Can we?
+
+With the elixir registry: no, it's explicitly a local-only registry.
+
+With PG2: yes, but all changes lock the cluster to ensure they're atomic, which causes scalability issues:
+
+---
+
+#### PG2 performance
+
+.fittoslide[![](./pg2-perf.png)]
+
+source: http://www.ostinelli.net/an-evaluation-of-erlang-global-process-registries-meet-syn/
+
+???
+
+You can see that as soon as we go from one node to 2, the max rate of changes decreases dramatically.
+
+OK, what what about gproc? It has a global mode.
+
+---
+
+#### gproc global mode
+
+
+???
+
+This is an interesting one.
+
+Gproc's global mode is kindof in flux at the moment. The released version uses a leader election module called `gen_leader`, which is used to elect a 'leader node', to keep everyone synchronised and resolve conflicts between nodes without having to do the PG2 / erlang global module thing of locking the cluster. Unfortunately the released version has quite a few known issues due to `gen_leader` issues, for example, you can't add a new node to the clster after it's started. The author is part way through a decade-long project to possibly solve these by moving away from `gen_leader` to a different solution called `locks_leader`, but the locks leader branch has seen only two commits since 2013, so progress is slow.
+
+In short, gproc in global mode doesn't seem to be a reliable solution at the moment, sadly.
+
+---
+
+### approach 2. property-based process registration
+
+#### advantages:
+
+- On a single node, scales a lot better than option 1
+
+#### Disadvantages:
+
+- no single point of synchronisation, so linearisability is harder
+
+- distributed? ...sorta
+
+--
+
+- scalability when distributed: ...
+
+???
+
+Scalability issues: channels with lots of subscribers. imagine you're on a distributed system with 4 nodes, and you have 40 thousand users subscribed to a channel, distributed evenly among the nodes.
+
+In a distributed process registration system, when someone publishes to that channel,
+
+---
+
+### distributed scalability: channels with lots of subscribers
+
+![](./scaling-bad.png)
+
+???
+
+it sends 40 thousand messages, and around 10 thousand get delivered to each node -- all separately, over the network.
+
+This isn't very inefficient. Really what you want is something that lets you have one message be delivered to any node that has a subscriber to that channel on it, and then have local fan-out within that node, something like
+
+---
+
+### distributed scalability: channels with lots of subscribers
+
+![](./scaling-good.png)
+
+???
+
+this.
+
+Another issue is
+
+---
+
+### distributed scalability: connection state recovery
+
+???
+
+connection state recovery. In a decent pub-sub service, the end-user should be able to transparently recover over short periods of lost connection, say of up to a minute or two. The 'obvious' way -- and the only way this is possible in the process group model -- is to have the subscriber process accumulate messages if they can't be pushed to the user. But there are subtleties here.
+
+For one thing, the connection process may not know what messages the end-user has received. It might be happily pushing messages over what it thinks is an active websocket, only for it to abruptly die and the user to reconnect and say that it hasn't received any messages since number 312 which was from 45 seconds ago. What do you do then?
+
+One answer is that the connection process could keep the last (say) two minutes of messages, in a sort-of rolling message window, so it can handle that situation. Great. Except now go back to that example of having 10k subscribers to a channel on each node. Now 10k processes on that node each have to keep a copy of every message sent in the last two minutes on that channel, and your subscribers-per-channel scalability is shot.
+
+So lets try approach three:
+
+---
+
+# approaches to pubsub in elixir
+
+1. .fade[keep subscription state in a process]
+
+2. .fade[property-based process registration]
+
+3. one 'master' process per channel, zero or one 'client' processes per channel per node, global process registration
+
+???
+
+One 'master' process per channel, zero or one 'client' processes per channel per node, with  global process registration.
+
+So, going back to that diagram from before:
+
+---
+
+### approach 3: master-client; global process registration
+
+![](./scaling-good.png)
+
+???
+
+The client can manage its local subscriptions however you like -- e.g.  using a local process group, maybe gproc in local property mode, or the Elixir registry in :duplicate mode.
+
+This solves several problems with the previous approach:
+
+---
+
+### approach 3: master-client; global process registration
+
+#### advantages:
+
+--
+
+- efficient messaging fanout, channels can scale to many subscribers
+
+???
+
+- the client-master model solves the millions-of-messages-being-sent-over-the-mesh problem
+
+--
+
+- each channel has a single point of synchronisation
+
+???
+
+- each channel has a single point of synchronisation - the channelmaster - so we get message stream linearisabilty, can easily apply channel rules, other outputs etc. at that point.
+
+(This does mean that the channelmaster is a bottleneck for that channel, but that's ok, because the channel can be our unit of scalability. As it turns out, this solves a bunch of other scaling problems -- we don't need to think about how every feature scales, we just need to make it work within the limits of a channel, and make sure number of channels can scale. And if someone needs a per-channel message rate higher than one channel can sustain, they can always shard messages across multiple channels.
+
+--
+
+- connection state recovery window can live on the channel client
+
+???
+
+Having one client process per channel per node means that for connection state recovery, the two minute 'message window' can live there rather than in each individual subscriber process, so only duplicated only once per node.
+
+---
+
+### approach 3: master-client; global process registration
+
+#### advantages:
+
+- efficient messaging fanout, channels can scale to many subscribers
+
+- each channel has a single point of synchronisation
+
+- connection state recovery window can live on the channel ~~client~~ master
+
+???
+
+Or even better, we can have it live in the channelmaster -- that way it's only in one place in the entire cluster. the channelclient can request a 'rewind' from the channelmaster as necessary.
+
+Why's that better? Because we want to be able to scale as close to linearly with number of nodes as possible -- we don't want a situation where the channelclients have to do/store so much that adding a new node to the cluster means it's already fully loaded with channelclient work before we add a single channelmaster to it.
+
+--
+
+#### disadvantages:
+
+- distributed scalability with number of channels: global process registration
+
+???
+
+But still need a global process registry for channelmasters. And really we want a strongly consistent one -- if we get multiple channelmasters for the same channel would be disastrous, we'd effectively get a channel split, so eventually-consistent registries like Syn aren't really in the running. So we need something like the erlang :global process registry).
+
+But then we run into the same problem that we ran into earlier with PG2, which is that if modifications lock the entire mesh, as they do with the global module, the rate at which we can have new channels goes sharply down as the size of the mesh grows:
+---
+
+#### `:global` performance
+
+.fittoslide[![](./global-perf.png)]
+
+source: http://www.ostinelli.net/an-evaluation-of-erlang-global-process-registries-meet-syn/
+
+???
+
+As you can see, pretty similar to the PG2 results.
+
+The other issue is that
+
+---
+
+### approach 3: master-client; global process registration
+
+#### advantages:
+
+- efficient messaging fanout, channels can scale to many subscribers
+
+- each channel has a single point of synchronisation
+
+- connection state recovery window can live on the channel ~~client~~ master
+
+#### disadvantages:
+
+- distributed scalability with number of channels: global process registration
+
+- adding new nodes doesn't take any of the existing load
+
+???
+
+adding a new node to the cluster takes a while to actually help much. Channelmasters will be at whatever node first registered them, and won't move unless that node shuts down. So they don't really take any of the existing load off your other nodes, they just take a share of any new channels -- and even that's only after they get their share of connections.
+
+Really, what we would be nice would be something where, on adding a new node, it automatically took up a fair proportion of the work to be done.
+
+For approach four we'll try to solve both of those problems at once:
+
+---
+
+# approaches to pubsub in elixir
+
+1. .fade[keep subscription state in a process]
+
+2. .fade[property-based process registration]
+
+3. .fade[one 'master' process per channel, zero or one 'client' processes per channel per node, global process registration]
+
+4. one 'master' process per channel, zero or one 'client' processes per channel per node, hashing
+
+???
+
+hashing! Hash the name of the channel and modulo that by the number of nodes you have.
+
+That way you don't need any global process registration because the channelmaster lives in a deterministic place in the cluster. That is, given the name of a channel, every node in the mesh can just work out which other node has that channel's channelmaster, without having to do any process registration.
+
+It also means that when a new node is added, it automatically takes up a fair share of the work to be done in the cluster.
+
+Unfortunately, it means almost all the channelmasters have to move when you add or remove a node. If you scale up from 4 to 5 nodes and start taking using the hash modulo 5 instead of modulo 4, only a fifth of channels will be on the same node they were on before.
+
+This is solved with:
+
+---
+
+# approaches to pubsub in elixir
+
+1. .fade[keep subscription state in a process]
+
+2. .fade[property-based process registration]
+
+3. .fade[one 'master' process per channel, zero or one 'client' processes per channel per node, global process registration]
+
+4. one 'master' process per channel, zero or one 'client' processes per channel per node, *consistent* hashing
+
+???
+
+Consistent hashing. For people who aren't familiar with consistent hashing, basically:
+
+---
+
+![](./riak-ring.png)
+
+Source: Basho
+
+???
+
+You have a hash ring. This is where you identify 0 with you max hash value, i.e. wrap it around into a circle. So every hashed channelname lives somewhere on the ring. Nodes then lay claim to segments of the ring, so node 1 here has claimed all the green bits of the ring, so any channels which hash to a value on those bits will live on node 1. If a new node is added, it will take a few segments of the ring for itself, so any channels that were on those segments will move to it. But no other channel have to move -- the only channel that move are ones moving to the new node.
+
+---
+
+# approaches to pubsub in elixir
+
+1. .fade[keep subscription state in a process]
+
+2. .fade[property-based process registration]
+
+3. .fade[one 'master' process per channel, zero or one 'client' processes per channel per node, global process registration]
+
+4. one 'master' process per channel, zero or one 'client' processes per channel per node, *consistent* hashing
+
+???
+
+We have finally arrived at our destination, because what this is is:
+
+---
+
+# approaches to pubsub in elixir
+
+1. .fade[keep subscription state in a process]
+
+2. .fade[property-based process registration]
+
+3. .fade[one 'master' process per channel, zero or one 'client' processes per channel per node, global process registration]
+
+4. riak core!
+
+???
+
+riak core.
+
+---
+
+### approach 4: riak core
+
+#### advantages:
+
+- channelmaster is a per-channel synchronisation point. each rules, outputs, filters etc.
+
+- connection state recovery window: lives on the channelmaster
+
+- distributed scaling (subscribers per channel): solved by client/master model; efficient message fanout
+
+- distributed scaling (number of channels): solved by the the hashring
+
+???
+
+We seem to have resolved all the problems we had.
+
+Riak core also helps us with a whole bunch of problems I haven't even mentioned, for example, nodes gossiping to agree amongst themselves on the state of the ring, and handoff, coordinated migration of channelmasters from one node to another.
+
+So lets look at what a basic pub/sub system in riak core might look like.
+
+
+
+
+[comparison with ably]
+
+
+
+
+
+
+    </textarea>
+    <script src="remark-latest.min.js">
+    </script>
+    <script>
+      var slideshow = remark.create({highlightStyle: 'github'});
+    </script>
+  </body>
+</html>
