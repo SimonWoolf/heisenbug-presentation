@@ -25,6 +25,8 @@
 
       .fittoslide > * { width: 100%; }
 
+      .eighty > * { width: 80%; }
+
       /* Thanks to http://www.partage-it.com/animez-vos-presentations-remark-js/  (in French) */
       .remark-fading { z-index: 9; }
       .remark-slide-container {transition: opacity 0.5s ease-out; opacity: 0;}
@@ -50,30 +52,26 @@ remark.js shortcuts:
 p for presenter mode
 c to create a new synced window
 
----
-
-???
-
-So: The first part of this talk isn't actually about Riak core. It's about how if you start thinking about how you'd design a system to solve a certain problem, in a way that scales, you might after a few iterations naturally end up at something that looks like Riak core.
+So: this talk isn't actually about Riak core - at least, the first part isn't. It's about how, if you start thinking about how you'd design a system to solve a certain problem, in a way that scales, you might after a few iterations naturally end up at something like Riak core.
 
 So, first things first, what is Ably? Ably is a Platform-as-a-service implementation of the pub-sub
 
---
+---
 
 # pubsub
 
 ???
 
-i.e. 'publish-subscribe' pattern. Others inclde Pusher and PubNub.
+i.e. 'publish-subscribe' pattern. Others include Pusher and PubNub.
 The pub-sub pattern is pretty simple:
 
 --
 
-![](./pubsub.png)
+.eighty[![](./pubsub.png)]
 
 ???
 
-it's a messaging pattern where the sender is decoupled from receiver. A publisher publishes messages into topics, or 'channels', that subscribers can subscribe to. The publisher doesn't need to know how many subscribers there are, it's the same amount of work for them to publish to a channel with one subscriber or a million.
+it's a messaging pattern where the sender is decoupled from the receiver. A publisher publishes messages into topics, or 'channels', that subscribers can subscribe to. The publisher doesn't need to know how many subscribers there are. it's the same amount of work for them to publish to a channel with one subscriber or a million.
 
 Sounds simple enough. Sounds like a fun thing to build from scratch in Elixir. So, what are the basic approaches we can take?
 
@@ -118,7 +116,7 @@ end
 
 ???
 
-with GenEvent, where each subscriber adds a genevent handler. A bit cleaner in some ways, but the overall effect is much the same, all information on who is subscribed to what channel is kept in one process.
+with GenEvent, where each subscriber adds a genevent handler. A bit cleaner in some ways, but the effect is much the same, all information on who is subscribed to what channel is kept in one process.
 
 ---
 
@@ -150,9 +148,22 @@ The disadvantages are:
 
 It doesn't scale. At all. That one process on one node is a bottleneck, everything goes through that.
 
+---
+
+### approach 1. keep subscription state in a process
+
+#### advantages:
+
+- linearisable message stream - consistent ordering, channel rules, channel outputs, etc.
+
+#### disadvantages:
+
+- doesn't scale. at all
+
+???
 OK, so that's not ideal. So how can we make it better?
 
-One way to say, ok, so what if messages don't actually go *through* process, what if the process just stores subscriber info and the publisher process can query that when it wants to publish a message to a channel, find out who's subscribing to that channel, and do the publishing itself.
+One way would be to say, ok, so what if messages don't actually go *through* that process, what if it just stores subscriber info and the publisher process can query it when it wants to publish a message to a channel, find out who's subscribing to that channel, and send the messages straight to them?
 
 Which is a fair point. So lets take that principle and say, well, if that's all it's doing, we can make it even better by not using a process at all, and instead using
 
@@ -188,11 +199,9 @@ the Elixir registry, gproc, and PG2.
 
 Quick reminder: the elixir registry can be used in either a mode where at most one process can register itself under a name, called 'unique' mode
 
-or where any number of processes can register themselves under a name, called 'duplicate' mode.
+or where any number of processes can register themselves under a name, called 'duplicate' mode, which is what gproc calls 'property-based' process registration.
 
-'property-based' process registration is another name for this 'duplicate' mode.
-
-So the idea is that if a subscriber process wants to subscribe to channel "channelname", it
+So the idea is that if a subscriber process wants to subscribe to channel "foo", it
 
 ---
 
@@ -201,12 +210,12 @@ So the idea is that if a subscriber process wants to subscribe to channel "chann
 #### the Elixir Registry
 
 ```elixir
-Registry.register(SubscriptionsRegistry, "channelname", null)
+Registry.register(SubscriptionsRegistry, "foo", null)
 ```
 
 ???
 
-registers itself to a registry in duplicate mode under the key 'channelname'. Then when a publisher wants to send a message to that channel, it can
+registers itself to a registry in duplicate mode under the key 'foo'. Then when a publisher wants to send a message to that channel, it uses
 
 --
 
@@ -218,7 +227,7 @@ end)
 
 ???
 
-use Registry.dispatch to the message to all the subscribers.
+Registry.dispatch to dispatch the message to all the subscribers.
 
 Gproc offers even more different modes:
 
@@ -254,9 +263,11 @@ Finally we have PG2
 
 ???
 
-PG stands for 'process groups'. This is an erlang builtin. and is one of the two backends that Phoenix PubSub can use. (The other one is admitting defeat and passing the problem onto redis, which is an approach I will speak no further of).
+PG stands for 'process groups'. This is an erlang builtin. and is one of the two backends that Phoenix PubSub can use.
 
-So:
+(The other thing Phoneix pubsub can do is just... *give up* and pass the problem onto redis. But we're not going to give up, are we? [raise arms, await 'no'])
+
+No more audience participation for you guys.
 
 ---
 
@@ -264,17 +275,11 @@ So:
 
 #### advantages:
 
-???
-
-The registry / gproc / process groups / ets tables approach
-
---
-
 - On a single node, scales a lot better than option 1
 
 ???
-
-Scales a lot better than the previous approach. All three property registries (especially the Elixir registry) make efficient use of ets tables to avoid bottlenecking.
+The registry / gproc / process groups / ets tables approach
+scales a lot better than the previous approach. All three property registries (especially the Elixir registry) make efficient use of ets tables to avoid bottlenecking.
 
 But there are some disadvantages:
 
@@ -286,7 +291,7 @@ But there are some disadvantages:
 
 ???
 
-Since you no longer a single process that all messages for a channel flow through, it's less obvious under what circumstances message ordering is still guaranteed, and it's harder to do channel rules, filters, extra outputs, and so on. Still possible, but less trivial.
+Since you no longer a single process that all messages for a channel flow through, it's less obvious under what circumstances message ordering is still guaranteed, and it's harder to do channel rules, filters, extra outputs, and so on. Still possible, but no longer trivial.
 
 --
 
@@ -294,7 +299,7 @@ Since you no longer a single process that all messages for a channel flow throug
 
 ???
 
-So, we're using the beam, we want to scale out by adding more nodes to our mesh. Can we?
+Distribution -- so, we're using the beam, we want to scale out by adding more nodes to our mesh. Can we?
 
 With the elixir registry: no, it's explicitly a local-only registry.
 
@@ -323,9 +328,9 @@ OK, what what about gproc? It has a global mode.
 
 This is an interesting one.
 
-Gproc's global mode is kindof in flux at the moment. The released version uses a leader election module called `gen_leader`, which is used to elect a 'leader node', to keep everyone synchronised and resolve conflicts between nodes without having to do the PG2 / erlang global module thing of locking the cluster. Unfortunately the released version has quite a few known issues due to `gen_leader` issues, for example, you can't add a new node to the clster after it's started. The author is part way through a decade-long project to possibly solve these by moving away from `gen_leader` to a different solution called `locks_leader`, but the locks leader branch has seen only two commits since 2013, so progress is slow.
+Gproc's global mode is kindof in flux at the moment. The released version uses a leader election module called `gen_leader`, which is used to elect a 'leader node', to keep everyone synchronised and resolve conflicts between nodes without having to do the PG2 / erlang global module thing of locking the cluster. Unfortunately the released version has quite a few known issues due to `gen_leader` issues. You can't add a new node to the cluster after it's started, and so on. As far as I can tell, the author is part way through a decade-long project to solve these by moving away from `gen_leader` to a different solution called `locks_leader`, but the locks leader branch has had only two commits since 2013, so I guess progress is slow.
 
-In short, gproc in global mode doesn't seem to be a reliable solution at the moment, sadly.
+In short, gproc in global mode doesn't seem to be a great solution at the moment, sadly.
 
 ---
 
@@ -343,7 +348,7 @@ In short, gproc in global mode doesn't seem to be a reliable solution at the mom
 
 --
 
-- scalability when distributed: ...
+- scalability with number of subscribers per channel when distributed: ...
 
 ???
 
@@ -361,7 +366,7 @@ In a distributed process registration system, when someone publishes to that cha
 
 it sends 40 thousand messages, and around 10 thousand get delivered to each node -- all separately, over the network.
 
-This isn't very inefficient. Really what you want is something that lets you have one message be delivered to any node that has a subscriber to that channel on it, and then have local fan-out within that node, something like
+This isn't very inefficient. Really what you want is something that lets you have one message be delivered to any node with more than zero subscribers on it, and then have local fan-out within that node, something like
 
 ---
 
@@ -381,11 +386,19 @@ Another issue is
 
 ???
 
-connection state recovery. In a decent pub-sub service, the end-user should be able to transparently recover over short periods of lost connection, say of up to a minute or two. The 'obvious' way -- and the only way this is possible in the process group model -- is to have the subscriber process accumulate messages if they can't be pushed to the user. But there are subtleties here.
+connection state recovery. In a decent pub-sub service, the end-user should be able to transparently recover over short periods of lost connection, say of up to a minute or two.
 
-For one thing, the connection process may not know what messages the end-user has received. It might be happily pushing messages over what it thinks is an active websocket, only for it to abruptly die and the user to reconnect and say that it hasn't received any messages since number 312 which was from 45 seconds ago. What do you do then?
+The 'obvious' way -- and the only way this is possible in the process group model -- is to have the subscriber process accumulate messages if they can't be pushed to the user. But there are subtleties here.
 
-One answer is that the connection process could keep the last (say) two minutes of messages, in a sort-of rolling message window, so it can handle that situation. Great. Except now go back to that example of having 10k subscribers to a channel on each node. Now 10k processes on that node each have to keep a copy of every message sent in the last two minutes on that channel, and your subscribers-per-channel scalability is shot.
+---
+
+### distributed scalability: connection state recovery
+
+???
+
+For one thing, the connection process may not know what messages the end-user has received. It might be happily pushing messages over what it thinks is an active websocket, only for the websocket to die and the user to reconnect and say that they haven't received any messages since number 312 which was from 45 seconds ago. What do you do then?
+
+Maybe the connection process could keep the last (say) two minutes of messages, in a sort-of rolling message window, so it can handle that situation. Great. Except now go back to that example of having 10k subscribers to a channel on each node. Now 10k processes on that node each have to keep a copy of every message sent in the last two minutes on that channel. That's not gonna work.
 
 So lets try approach three:
 
@@ -403,7 +416,7 @@ So lets try approach three:
 
 One 'master' process per channel, zero or one 'client' processes per channel per node, with  global process registration.
 
-So, going back to that diagram from before:
+going back to that diagram from before:
 
 ---
 
@@ -437,7 +450,7 @@ This solves several problems with the previous approach:
 
 ???
 
-- each channel has a single point of synchronisation - the channelmaster - so we get message stream linearisabilty, can easily apply channel rules, other outputs etc. at that point.
+- each channel has a single point of synchronisation - the channelmaster - so we get we get the advantages of that - channel rules and so on.
 
 (This does mean that the channelmaster is a bottleneck for that channel, but that's ok, because the channel can be our unit of scalability. As it turns out, this solves a bunch of other scaling problems -- we don't need to think about how every feature scales, we just need to make it work within the limits of a channel, and make sure number of channels can scale. And if someone needs a per-channel message rate higher than one channel can sustain, they can always shard messages across multiple channels.
 
@@ -447,7 +460,7 @@ This solves several problems with the previous approach:
 
 ???
 
-Having one client process per channel per node means that for connection state recovery, the two minute 'message window' can live there rather than in each individual subscriber process, so only duplicated only once per node.
+Having one client process per channel per node means that for connection state recovery, the two minute 'message window' can live there rather than in each individual subscriber process, so only duplicated once per node.
 
 ---
 
@@ -467,7 +480,17 @@ Or even better, we can have it live in the channelmaster -- that way it's only i
 
 Why's that better? Because we want to be able to scale as close to linearly with number of nodes as possible -- we don't want a situation where the channelclients have to do/store so much that adding a new node to the cluster means it's already fully loaded with channelclient work before we add a single channelmaster to it.
 
---
+---
+
+### approach 3: master-client; global process registration
+
+#### advantages:
+
+- efficient messaging fanout, channels can scale to many subscribers
+
+- each channel has a single point of synchronisation
+
+- connection state recovery window can live on the channel ~~client~~ master
 
 #### disadvantages:
 
@@ -475,9 +498,9 @@ Why's that better? Because we want to be able to scale as close to linearly with
 
 ???
 
-But still need a global process registry for channelmasters. And really we want a strongly consistent one -- if we get multiple channelmasters for the same channel would be disastrous, we'd effectively get a channel split, so eventually-consistent registries like Syn aren't really in the running. So we need something like the erlang :global process registry).
+But still need a global process registry for channelmasters. And really we want a strongly consistent one -- having multiple channelmasters for the same channel would be disastrous, we'd effectively get a channel split, so eventually-consistent registries like Syn aren't really in the running. So we need something like the erlang :global process registry).
 
-But then we run into the same problem that we ran into earlier with PG2, which is that if modifications lock the entire mesh, as they do with the global module, the rate at which we can have new channels goes sharply down as the size of the mesh grows:
+But then we run into the same problem that we had earlier with PG2, which is that if modifications lock the entire mesh, as they do with the global module, the rate at which we can add new channels goes sharply down as the size of the mesh grows:
 ---
 
 #### `:global` performance
@@ -512,11 +535,11 @@ The other issue is that
 
 ???
 
-adding a new node to the cluster takes a while to actually help much. Channelmasters will be at whatever node first registered them, and won't move unless that node shuts down. So they don't really take any of the existing load off your other nodes, they just take a share of any new channels -- and even that's only after they get their share of connections.
+adding a new node to the cluster takes a while to actually help much. Channelmasters will be at whatever node first registered them, and won't move unless that node shuts down. So they don't really take any of the existing load off your other nodes, they just take a share of any *new* channels -- and even that's only after they get their share of new connections.
 
-Really, what we would be nice would be something where, on adding a new node, it automatically took up a fair proportion of the work to be done.
+Really, what would be nice would be something where, on adding a new node, it automatically took up a fair proportion of the work to be done.
 
-For approach four we'll try to solve both of those problems at once:
+We can have a stab at solving both of those problems at once using:
 
 ---
 
@@ -538,7 +561,7 @@ That way you don't need any global process registration because the channelmaste
 
 It also means that when a new node is added, it automatically takes up a fair share of the work to be done in the cluster.
 
-Unfortunately, it means almost all the channelmasters have to move when you add or remove a node. If you scale up from 4 to 5 nodes and start taking using the hash modulo 5 instead of modulo 4, only a fifth of channels will be on the same node they were on before.
+Unfortunately, it means almost all the channelmasters have to move when you add or remove a node. If you scale up from 4 to 5 nodes and start taking the channel name hash modulo 5 instead of modulo 4, only a fifth of channels will be on the same node they were on before.
 
 This is solved with:
 
@@ -566,7 +589,9 @@ Source: Basho
 
 ???
 
-You have a hash ring. This is where you identify 0 with you max hash value, i.e. wrap it around into a circle. So every hashed channelname lives somewhere on the ring. Nodes then lay claim to segments of the ring, so node 1 here has claimed all the green bits of the ring, so any channels which hash to a value on those bits will live on node 1. If a new node is added, it will take a few segments of the ring for itself, so any channels that were on those segments will move to it. But no other channel have to move -- the only channel that move are ones moving to the new node.
+You have a hash ring. This is where you identify 0 with you max hash value, i.e. wrap it around into a circle. So every hashed channelname lives somewhere on the ring. Nodes then lay claim to segments of the ring, so node 1 here has claimed all the green bits of the ring, so any channels which hash to a value on those bits will live on node 1.
+
+If a new node is added, it will take a few segments of the ring for itself, so any channels that were on those segments will move to it. But no other channel has to move -- the only channels that move are ones moving to the new node.
 
 ---
 
@@ -582,7 +607,7 @@ You have a hash ring. This is where you identify 0 with you max hash value, i.e.
 
 ???
 
-We have finally arrived at our destination, because what this is is:
+And we have finally arrived at our destination, because what this is is:
 
 ---
 
@@ -616,11 +641,9 @@ riak core.
 
 ???
 
-We seem to have resolved all the problems we had.
+And with that , we seem to have resolved all the problems we had.
 
-Riak core also helps us with a whole bunch of problems I haven't even mentioned, for example, nodes gossiping to agree amongst themselves on the state of the ring, and handoff, coordinated migration of channelmasters from one node to another.
-
-So lets look at what a basic pub/sub system in riak core might look like. Here's one I made earlier, which I called "ably-ng"
+So now lets look at what a basic pub/sub system in riak core might look like. Here's a half-finished and pretty rudimentary one I made earlier, which I called "ably-ng"
 
 ---
 
@@ -645,7 +668,9 @@ defp deps do
 
 ???
 
-First a quick note on installing it. The hex package is called riak-core-ng. Some of the dependencies specified by the hex package seem to be a bit tempermental about compiling on recent versions of Erlang. After some experimentation I found a combination that worked with erlang 19, but you have to manually force some more recent versions of deps like cuttlefish than are specified in the riak core package. If you want to play around with riak core and run into the same difficulties, it may be easiest to clone the repo with this on it, I'll put a github url up at the end.
+First a quick note on installing it. The hex package is called riak-core-ng. Some of the dependencies specified by the hex package seem to be a bit tempermental about compiling on recent versions of Erlang.
+
+I found a combination that worked with erlang 19, but you have to manually force some more recent versions of deps like cuttlefish than are specified in the riak core package. If you try riak core and you run into the same difficulties, you could always clone the repo with this on it, I'll put a github url up at the end.
 
 ---
 
@@ -684,9 +709,23 @@ Source: Basho
 
 ???
 
-Here's that diagram of the riak core ring again. (I didn't mention at the time that it was the riak core ring specifically, but it is -- Basho are the company that make Riak). rather than having channelmasters living 'directly on the ring' in a sense, riak uses an abstraction called a vnode, which stands for 'virtual node', which is basically just a small segment of the ring -- each of those coloured sections is a vnode. Each erlang node will have several vnodes. The channelmasters live on the vnodes, the vnodes live on the ring.
+Here's that diagram of the riak core ring again. (I didn't mention at the time that it was the riak core ring specifically, but it is -- Basho are the company that make Riak).
 
-This might seem like it complicates things, but it's actually a quite nice abstraction - it separates the job of 'knowing where I am on the ring' from the job of 'being a channelmaster'. So when the ring state changes, rather than all 100 thousand channels on the node having to work out if they need to relocate themselves, only the (say) 16 vnodes do that. The channelmasters still live on the ring in the sense that they have a hash, but that hash tells them which vnode they're on, and that never changes. When nodes are added and removed, the vnodes move around between them, but the channelmaster is always on the 'same' vnode.
+rather than having channelmasters live in some sense 'directly on the ring', riak uses an abstraction called a vnode, which stands for 'virtual node', which is basically just a small segment of the ring -- each of those individual little segments is a vnode.
+
+Each erlang node will have several vnodes -- in that diagram, 8. The channelmasters live on the vnodes, the vnodes live on the ring.
+
+---
+
+![](./riak-ring.png)
+
+Source: Basho
+
+???
+
+This might seem like it complicates things, but it's actually a quite nice abstraction - it separates the job of 'knowing where I am on the ring' from the job of 'being a channelmaster'. So when the ring state changes, rather than all 100 thousand channels on the node having to work out if they need to relocate themselves, only the (say) 16 vnodes do that.
+
+The channelmasters still live on the ring in the sense that they have a hash, but that hash tells them which vnode they're on, and that never changes. When nodes are added and removed, the vnodes move around between them, but the channelmaster is always on the 'same' vnode.
 
 ---
 
@@ -788,9 +827,9 @@ end
 
 ???
 
-Next comes the attachment registry, which keeps a list of what connections are attached to which channels. It's a duplicate registry as of course you can have multiple connections attached to the same channels.
+Next comes the attachment registry, which keeps a list of what connections are attached to which channels.
 
-Finally comes the connection supervisor and the channelclient supervisor. I'll skip over the details of websocket and connection handling as not really relevant to the talk -- you can have a look at the repo if interested -- and focus just on the channelclient and channelmaster. suffice to say that if the connection wants to attach to a channel it first makes sure there's a channelclient for it on that node. So here's part of a channelclient:
+Finally comes the connection supervisor and the channelclient supervisor. I'll skip over the details of websocket and connection handling as not really relevant to the talk. suffice to say that if the connection wants to attach to a channel it first makes sure there's a channelclient for it on that node. So here's part of a channelclient:
 
 ---
 
@@ -864,22 +903,182 @@ end
 ```
 
 ???
-Here's part of the Service module. so get_master takes a type and a key. Type here is "channel", we want a channelmaster. (In the real ably there are also applicationmasters, accountmasters, and a few others). The key is the app ID plus the name of the channel. It calls run_on_vnode with the type, the key, and the data it wants to actually pass to the vnode.
+Here's part of the Service module. so get_master takes a type and a key. Type here is "channel", we want a channelmaster. (In the real ably there are also applicationmasters and accountmasters). The key is the app ID plus the name of the channel. It calls run_on_vnode with the type, the key, and the data it wants to actually pass to the vnode.
 
-run_on_vnode takes the type and the key and calls riak_core_util.chash_key, which returns a ring position -- basically an integer from 0 to 2 to the power 160, though expressed as a binary, probably for efficiency or something
+run_on_vnode takes the type and the key and calls riak_core_util.chash_key, which returns a ring position -- basically an integer from 0 to 2 to the power 160, expressed as a binary
 
 we then pass that to another function to get the index of the vnode that that ring position lies on, together with the instance that that vnode is on. (You can have this give you multiple vnodes if you're storing data and want to replicate it).
 
+---
+
+```elixir
+defmodule AblyNg.Service do
+  require Logger
+
+  def get_master(type, key) do
+    # Note that we pass in the type/key twice -- first so riak core can locate
+    # the vnode handling that master, second to pass to that vnode
+    run_on_vnode(type, key, {:master, {type, key}})
+  end
+
+  defp run_on_vnode(type, key, command) do
+    # Hash the key to a ring position
+    idx = :riak_core_util.chash_key({type, key})
+
+    # get an active preference list (ordered list of vnodes responsible for
+    # that key). Want only one vnode per channel etc, so require length 1.
+    # Last param: restrict to nodes that implement this service
+    [{index_node, _}] = :riak_core_apl.get_primary_apl(idx, 1, AblyNg.Service)
+
+    # riak core appends "_master" to the vnode name.
+    :riak_core_vnode_master.sync_spawn_command(index_node, command, AblyNg.Vnode_master)
+  end
+
+  ...
+end
+```
+
+???
+
 Finally, we pass the vnode index to sync_spawn_command, which sends your message off to that vnode.
 
-Note that we don't do all of this every time the channelclient sends a message to the channelmaster. Once the channelclient has the channelmaster's pid, it can just use normal erlang message passing. If the channelmaster moves, it can notify all its clients that they should discard that pid and get a new one -- or better still, the clients can just use process monitoring, so erlang will notify them if that master has died, and they can do this process to get the new location of the master.
+Note that we don't do all of this every time the channelclient sends a message to the channelmaster. Once the channelclient has the channelmaster's pid, it can just use normal erlang message passing. If the channelmaster moves, it can notify all its clients that they should discard that pid -- or better still, the clients can just use process monitoring, so erlang will notify them if that master has died, and they can do all this again to get the new location of the master.
 
-[comparison with ably]
+OK, so lets have a look at the vnode itself!
 
+---
 
+```elixir
+defmodule AblyNg.Vnode do
+  require Logger
+  @behaviour :riak_core_vnode
 
+  def start_vnode(partition) do
+    :riak_core_vnode_master.get_vnode_pid(partition, __MODULE__)
+  end
 
+  def init([partition]) do
+    {:ok, %{partition: partition, masters: %{channel: %{}}}}
+  end
 
+  ...
+end
+```
+
+???
+
+It's a process. that implements the riak_core_vnode behaviour. It knows its partition (which is what section of the ring it claims), and what masters live on it.
+
+---
+
+```elixir
+defmodule AblyNg.Vnode do
+  ...
+
+  def handle_command({:master, {type, key}}, _sender, state) do
+    try do
+      {master, state} =  case state.masters[type] do
+        %{^key => master} ->
+          {master, state}
+        _ ->
+          master = spawn_master(type, key)
+          {master, put_in(state.masters[type][key], master)}
+      end
+      {:reply, {:ok, master}, state}
+    rescue
+      e -> {:reply, {:error, e}, state}
+    end
+  end
+
+  defp spawn_master(:channel, key) do
+      {:ok, pid} = AblyNg.ChannelMaster.start_link(key)
+      pid
+  end
+
+  ...
+end
+```
+
+???
+
+When a client sends this master command to it -- which is what the get_master function we were looking at before does -- it returns the pid of the master if one exists, or spawns a new one if not.
+
+Vnodes have a bunch of other callbacks to implement, for example some concerned with letting you run code at different stages of handoff, when vnodes migrate from one core to another.
+
+---
+
+```elixir
+defmodule AblyNg.ChannelMaster do
+  ...
+
+  def handle_call({:add_client, client_pid, node_name}, _, state = %{
+    clients: clients
+  }) do
+    if Map.has_key?(clients, node_name) do
+      Logger.warn("existing client for node #{node_name}: " <>
+      "#{inspect clients[node_name]}. Replacing with #{inspect client_pid}")
+    end
+    Process.monitor(client_pid)
+    state = put_in(state.clients[node_name], client_pid)
+    {:reply, :ok, state}
+  end
+
+  def handle_cast({:incoming, message}, state) do
+    for {_, client} <- state.clients do
+      ChannelClient.on_message(client, message)
+    end
+    {:noreply, state}
+  end
+
+  ...
+end
+```
+
+???
+
+And those are the main bits, really. Channelclients stay alive as long as one or more connections are attached to them. Channelmasters stay alive as long as they have one or more channelclients. Clients and channels can monitor each other with normal erlang process monitoring, so can get notifications if the other one dies (even if that's due to the whole node dying, erlang takes care of that for us).
+
+---
+
+### So, is this how Ably works?
+
+???
+
+So, an obvious question is, is this what Ably actually does? Sortof.  We don't use Riak core itself -- for one thing, while some of our system's in Elixir, a lot of it's in NodeJS, and a bit of Go. But the basic architecture is more or less the same as what I've described, with some extra complicating factors.
+
+The biggest of those is that the real ably is a global system -- it runs in multiple different AWS regions, with the idea that if you publish a message in australia, then subscribers to that channel who're also in australia shouldn't have to wait for the message to go to the US and back in a realtime system. But obviously if someone in the US attaches to that channel, they still need to get the message, we can't only deliver it to people in australia.
+
+---
+### So, is this how Ably works?
+???
+
+So every region that a channel is active in has its own channelmaster that lives on a regional ring, and there's also a global channelmaster that lives on a global ring that coordinates the regional channelmasters and make sure they're all subscribing to each other's messages.
+
+The global ring also holds app and accountmasters (which accumulate stats, control access and so forth).
+
+---
+### So, is this how Ably works?
+???
+
+And then there's all the other stuff you need for an actual realtime message platform like authentication, stats & analytics, presence, permissions and capabilities, history, a REST api, fallback transports, channel rules, end-to-end encryption, queue outputs, webhooks, firehose, adaptors for other protocols like mqtt, channel and connection lifecycle events, a dev console, mobile push notifications, and so on and so forth.
+
+---
+
+class: center, middle
+
+.ably[![](./header_logo.svg)]
+
+## https://github.com/simonwoolf/ably-ng
+
+## we're hiring (remote friendly): https://jobs.ably.io
+
+## simon@ably.io
+
+???
+
+There's the repo url if you want to play around with it, and if that all sounds interesting, we're hiring developers and are remote friendly, so there's the url for that, if you're ok with doing some nodejs too.
+
+Any questions?
 
     </textarea>
     <script src="remark-latest.min.js">
