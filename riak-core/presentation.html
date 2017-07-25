@@ -620,10 +620,259 @@ We seem to have resolved all the problems we had.
 
 Riak core also helps us with a whole bunch of problems I haven't even mentioned, for example, nodes gossiping to agree amongst themselves on the state of the ring, and handoff, coordinated migration of channelmasters from one node to another.
 
-So lets look at what a basic pub/sub system in riak core might look like.
+So lets look at what a basic pub/sub system in riak core might look like. Here's one I made earlier, which I called "ably-ng"
 
+---
 
+### mix.exs
 
+```elixir
+defp deps do
+  [
+    {:riak_core, "~> 3.0", hex: :riak_core_ng},
+    {:cowboy, github: "ninenines/cowboy", tag: "2.0.0-pre.8"},
+    {:poison, "~> 3.1"},
+    # nb see https://github.com/project-fifo/riak_core/issues/20
+    {:cuttlefish, github: "basho/cuttlefish", tag: "2.0.11", manager: :rebar3, override: true},
+    {:lager, github: "basho/lager", tag: "3.2.4", manager: :rebar3, override: true},
+    {:goldrush, github: "basho/goldrush", tag: "0.1.9", manager: :rebar3, override: true},
+
+    # Test deps
+    {:socket, "~> 0.3.11", only: :test},
+  ]
+  end
+```
+
+???
+
+First a quick note on installing it. The hex package is called riak-core-ng. Some of the dependencies specified by the hex package seem to be a bit tempermental about compiling on recent versions of Erlang. After some experimentation I found a combination that worked with erlang 19, but you have to manually force some more recent versions of deps like cuttlefish than are specified in the riak core package. If you want to play around with riak core and run into the same difficulties, it may be easiest to clone the repo with this on it, I'll put a github url up at the end.
+
+---
+
+### application
+
+```elixir
+defmodule AblyNg do
+  use Application
+  require Logger
+
+  def start(_type, _args) do
+    case AblyNg.Supervisor.start_link do
+      {:ok, pid} ->
+        :ok = :riak_core.register(vnode_module: AblyNg.Vnode)
+        :ok = :riak_core_node_watcher.service_up(AblyNg.Service, self())
+        Logger.debug("Started AblyNg")
+        {:ok, pid}
+      {:error, reason} ->
+        Logger.error("Unable to start AblyNg supervisor: #{inspect reason}")
+    end
+  end
+end
+```
+
+???
+
+OK, so here's the application. I start the supervision tree, then call riak_core.register, and pass in a vnode module.
+
+hang on, what's a vnode?
+
+---
+
+![](./riak-ring.png)
+
+Source: Basho
+
+???
+
+Here's that diagram of the riak core ring again. (I didn't mention at the time that it was the riak core ring specifically, but it is -- Basho are the company that make Riak). rather than having channelmasters living 'directly on the ring' in a sense, riak uses an abstraction called a vnode, which stands for 'virtual node', which is basically just a small segment of the ring -- each of those coloured sections is a vnode. Each erlang node will have several vnodes. The channelmasters live on the vnodes, the vnodes live on the ring.
+
+This might seem like it complicates things, but it's actually a quite nice abstraction - it separates the job of 'knowing where I am on the ring' from the job of 'being a channelmaster'. So when the ring state changes, rather than all 100 thousand channels on the node having to work out if they need to relocate themselves, only the (say) 16 vnodes do that. The channelmasters still live on the ring in the sense that they have a hash, but that hash tells them which vnode they're on, and that never changes. When nodes are added and removed, the vnodes move around between them, but the channelmaster is always on the 'same' vnode.
+
+---
+
+### supervisor
+
+```elixir
+defmodule AblyNg.Supervisor do
+  use Supervisor
+
+  def start_link do
+    # riak_core appends _sup to the application name.
+    Supervisor.start_link(__MODULE__, [], [name: :ably_ng_sup])
+  end
+
+  def init(_args) do
+    children = [
+      worker(:riak_core_vnode_master, [AblyNg.Vnode], id: AblyNg.Vnode_master_worker),
+      worker(AblyNg.Frontend.WsServer, []),
+      supervisor(Registry, [:duplicate, AblyNg.AttachmentRegistry,
+        [partitions: System.schedulers_online()]], id: :attachment_registry),
+      supervisor(AblyNg.Frontend.ConnectionSupervisor, []),
+      supervisor(AblyNg.ChannelClientSupervisor, []),
+    ]
+    supervise(children, strategy: :one_for_one, max_restarts: 5, max_seconds: 10)
+  end
+end
+```
+
+???
+
+With that in mind, here's the top-level supervisor.
+
+First thing it starts is the riak core vnode master, which is a riak core process that handles sending messages to the vnodes. Again, we pass it our vnode module.
+
+Next we start our websocket server, which
+
+---
+
+```elixir
+defmodule AblyNg.Frontend.WsServer do
+  require Logger
+
+  def start_link() do
+    port = Application.fetch_env!(:ably_ng, :ws_port)
+    {:ok, cowboy_pid} = :cowboy.start_clear(
+      :ws,
+      100,
+      [ # ranch options
+        port: port,
+        max_connections: 10000
+      ],
+      %{ # cowboy options
+        env: %{dispatch: routes()}
+      }
+    )
+
+    Logger.info "Started cowboy on pid #{inspect cowboy_pid}, listening on port #{inspect port}."
+    {:ok, cowboy_pid}
+  end
+
+  defp routes do
+    :cowboy_router.compile([
+      {:_, # Match all hostnames
+        [{"/", AblyNg.Frontend.WsHandler, []}]
+      }])
+  end
+end
+```
+
+???
+basically just starts cowboy.
+
+---
+
+### supervisor
+
+```elixir
+defmodule AblyNg.Supervisor do
+  use Supervisor
+
+  def start_link do
+    # riak_core appends _sup to the application name.
+    Supervisor.start_link(__MODULE__, [], [name: :ably_ng_sup])
+  end
+
+  def init(_args) do
+    children = [
+      worker(:riak_core_vnode_master, [AblyNg.Vnode], id: AblyNg.Vnode_master_worker),
+      worker(AblyNg.Frontend.WsServer, []),
+      supervisor(Registry, [:duplicate, AblyNg.AttachmentRegistry,
+        [partitions: System.schedulers_online()]], id: :attachment_registry),
+      supervisor(AblyNg.Frontend.ConnectionSupervisor, []),
+      supervisor(AblyNg.ChannelClientSupervisor, []),
+    ]
+    supervise(children, strategy: :one_for_one, max_restarts: 5, max_seconds: 10)
+  end
+end
+```
+
+???
+
+Next comes the attachment registry, which keeps a list of what connections are attached to which channels. It's a duplicate registry as of course you can have multiple connections attached to the same channels.
+
+Finally comes the connection supervisor and the channelclient supervisor. I'll skip over the details of websocket and connection handling as not really relevant to the talk -- you can have a look at the repo if interested -- and focus just on the channelclient and channelmaster. suffice to say that if the connection wants to attach to a channel it first makes sure there's a channelclient for it on that node. So here's part of a channelclient:
+
+---
+
+```elixir
+defmodule AblyNg.ChannelClient do
+  ...
+
+  def init(key) do
+    [app_id, channel_name] = String.split(key, ":")
+    {:ok, channel_master} = Service.get_master(:channel, key)
+    ChannelMaster.add_client(channel_master)
+    Logger.debug("New ChannelClient initialized: #{inspect self()}, key: #{key}")
+    {:ok, %{key: key, channel_master: channel_master, channel_name: channel_name, app_id: app_id}}
+  end
+
+  def handle_cast({:incoming, messages}, state) do
+    protocol_message = %ProtocolMessage{
+      action: @action_message,
+      channel: state.channel_name,
+      messages: messages
+    }
+    Registry.dispatch(AttachmentRegistry, state.key, fn(attachments) ->
+      for {connection, _} <- attachments do
+        ConnectionMaster.send_protocol_message(connection, protocol_message)
+      end
+    end)
+    {:noreply, state}
+  end
+
+  def handle_cast({:publish, message}, state) do
+    ChannelMaster.on_message(state.channel_master, message)
+    {:noreply, state}
+  end
+
+  ...
+end
+```
+
+???
+On start, it gets the pid of the channelmaster with Service.get_master, and then simply passes any messages it's given on to it. If it gets a message from the channelmaster, it distributes it out to all connections attached to that channel using the attachment registry.
+
+OK, so what's Service.get_master?
+
+---
+
+```elixir
+defmodule AblyNg.Service do
+  require Logger
+
+  def get_master(type, key) do
+    # Note that we pass in the type/key twice -- first so riak core can locate
+    # the vnode handling that master, second to pass to that vnode
+    run_on_vnode(type, key, {:master, {type, key}})
+  end
+
+  defp run_on_vnode(type, key, command) do
+    # Hash the key to a ring position
+    idx = :riak_core_util.chash_key({type, key})
+
+    # get an active preference list (ordered list of vnodes responsible for
+    # that key). Want only one vnode per channel etc, so require length 1.
+    # Last param: restrict to nodes that implement this service
+    [{index_node, _}] = :riak_core_apl.get_primary_apl(idx, 1, AblyNg.Service)
+
+    # riak core appends "_master" to the vnode name.
+    :riak_core_vnode_master.sync_spawn_command(index_node, command, AblyNg.Vnode_master)
+  end
+
+  ...
+end
+```
+
+???
+Here's part of the Service module. so get_master takes a type and a key. Type here is "channel", we want a channelmaster. (In the real ably there are also applicationmasters, accountmasters, and a few others). The key is the app ID plus the name of the channel. It calls run_on_vnode with the type, the key, and the data it wants to actually pass to the vnode.
+
+run_on_vnode takes the type and the key and calls riak_core_util.chash_key, which returns a ring position -- basically an integer from 0 to 2 to the power 160, though expressed as a binary, probably for efficiency or something
+
+we then pass that to another function to get the index of the vnode that that ring position lies on, together with the instance that that vnode is on. (You can have this give you multiple vnodes if you're storing data and want to replicate it).
+
+Finally, we pass the vnode index to sync_spawn_command, which sends your message off to that vnode.
+
+Note that we don't do all of this every time the channelclient sends a message to the channelmaster. Once the channelclient has the channelmaster's pid, it can just use normal erlang message passing. If the channelmaster moves, it can notify all its clients that they should discard that pid and get a new one -- or better still, the clients can just use process monitoring, so erlang will notify them if that master has died, and they can do this process to get the new location of the master.
 
 [comparison with ably]
 
