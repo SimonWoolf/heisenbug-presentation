@@ -52,7 +52,7 @@ remark.js shortcuts:
 p for presenter mode
 c to create a new synced window
 
-So: this talk isn't actually about Riak core - at least, the first part isn't. It's about how, if you start thinking about how you'd design a system to solve a certain problem, in a way that scales, you might after a few iterations naturally end up at something like Riak core.
+So, we're not going to start out by looking at Riak core. We're just gonna think about how we can design a system, starting in the simplest way possible and solving problems as we go, and see where we end up.
 
 So, first things first, what is Ably? Ably is a Platform-as-a-service implementation of the pub-sub
 
@@ -71,11 +71,11 @@ The pub-sub pattern is pretty simple:
 
 ???
 
-it's a messaging pattern where the sender is decoupled from the receiver. A publisher publishes messages into topics, or 'channels', that subscribers can subscribe to. The publisher doesn't need to know how many subscribers there are. it's the same amount of work for them to publish to a channel with one subscriber or a million.
+it's a messaging pattern where the sender is decoupled from the receiver. A publisher publishes messages into topics, or 'channels', that subscribers can subscribe to. So it's the same amount of work for them to publish to a channel with one subscriber or a million.
 
-Sounds simple enough. Sounds like a fun thing to build from scratch in Elixir. So, what are the basic approaches we can take?
+Sounds simple enough. Sounds like a fun thing to build from scratch in Elixir. So, what's the simplest and most obvious way we could do that?
 
-First the simplest and most obvious slash naive way: just keep all subscription state in a process
+well, just keep all subscription state in a process
 
 ---
 
@@ -124,19 +124,19 @@ with GenEvent, where each subscriber adds a genevent handler. A bit cleaner in s
 
 ???
 
-The advantages of this approach is that
+This has the advantage that
 
 --
 
 #### advantages:
 
-- linearisable message stream - consistent ordering, channel rules, channel outputs, etc.
+- single point of synchronisation - consistent ordering, channel rules, channel outputs, etc.
 
 ???
 
-Having one process makes things very simple. There's one point of synchronisation, so consistent message ordering just happens, and it's very easy to add additional rules, or filters, or extra outputs, or anything else -- there's only one place to put them.
+there's one point of synchronisation, so consistent message ordering just happens, and it's very easy to add additional rules, or filters, or extra outputs, or anything else -- there's only one place to put them.
 
-The disadvantages are:
+The downside is of course that
 
 --
 
@@ -154,7 +154,7 @@ It doesn't scale. At all. That one process on one node is a bottleneck, everythi
 
 #### advantages:
 
-- linearisable message stream - consistent ordering, channel rules, channel outputs, etc.
+- single point of synchronisation - consistent ordering, channel rules, channel outputs, etc.
 
 #### disadvantages:
 
@@ -163,9 +163,9 @@ It doesn't scale. At all. That one process on one node is a bottleneck, everythi
 ???
 OK, so that's not ideal. So how can we make it better?
 
-One way would be to say, ok, so what if messages don't actually go *through* that process, what if it just stores subscriber info and the publisher process can query it when it wants to publish a message to a channel, find out who's subscribing to that channel, and send the messages straight to them?
+One way would be to say, ok, so what if messages don't actually go *through* that process, what if it just stores subscriber info, and the publisher process can query it to find out who's subscribing to that channel, and send the messages itself?
 
-Which is a fair point. So lets take that principle and say, well, if that's all it's doing, we can make it even better by not using a process at all, and instead using
+Which is a fair point. So lets take that idea and say, well, if that's all it's doing, we can make it even better by not using a process at all, and instead using
 
 ---
 
@@ -197,9 +197,9 @@ c. PG2
 
 the Elixir registry, gproc, and PG2.
 
-Quick reminder: the elixir registry can be used in either a mode where at most one process can register itself under a name, called 'unique' mode
+So: the elixir registry can be used in either a mode where at most one process can register itself under a name, called 'unique' mode
 
-or where any number of processes can register themselves under a name, called 'duplicate' mode, which is what gproc calls 'property-based' process registration.
+or where any number of processes can register themselves under a name, called 'duplicate' mode. This approach will use duplicate mode.
 
 So the idea is that if a subscriber process wants to subscribe to channel "foo", it
 
@@ -279,7 +279,7 @@ No more audience participation for you guys.
 
 ???
 The registry / gproc / process groups / ets tables approach
-scales a lot better than the previous approach. All three property registries (especially the Elixir registry) make efficient use of ets tables to avoid bottlenecking.
+scales a lot better than the previous approach. All three registries make efficient use of ets tables to avoid bottlenecking.
 
 But there are some disadvantages:
 
@@ -293,7 +293,17 @@ But there are some disadvantages:
 
 Since you no longer a single process that all messages for a channel flow through, it's less obvious under what circumstances message ordering is still guaranteed, and it's harder to do channel rules, filters, extra outputs, and so on. Still possible, but no longer trivial.
 
---
+---
+
+### approach 2. property-based process registration
+
+#### advantages:
+
+- On a single node, scales a lot better than option 1
+
+#### Disadvantages:
+
+- no single point of synchronisation, so linearisability is harder
 
 - distributed? ...sorta
 
@@ -323,12 +333,19 @@ OK, what what about gproc? It has a global mode.
 
 #### gproc global mode
 
-
 ???
 
 This is an interesting one.
 
-Gproc's global mode is kindof in flux at the moment. The released version uses a leader election module called `gen_leader`, which is used to elect a 'leader node', to keep everyone synchronised and resolve conflicts between nodes without having to do the PG2 / erlang global module thing of locking the cluster. Unfortunately the released version has quite a few known issues due to `gen_leader` issues. You can't add a new node to the cluster after it's started, and so on. As far as I can tell, the author is part way through a decade-long project to solve these by moving away from `gen_leader` to a different solution called `locks_leader`, but the locks leader branch has had only two commits since 2013, so I guess progress is slow.
+Gproc's global mode is kindof in flux at the moment. The released version uses a leader election module called `gen_leader`, which is used to elect a 'leader node', to keep everyone synchronised and resolve conflicts between nodes without having to do the PG2 / erlang global module thing of locking the cluster. Unfortunately the released version has quite a few known issues due to `gen_leader` issues -- fox example, you can't add a new node to the cluster after it's started.
+
+---
+
+#### gproc global mode
+
+???
+
+As far as I can tell, the author is part way through a decade-long project to solve these by moving away from `gen_leader` to a different solution called `locks_leader`, but the locks leader branch has had only two commits since 2013, so I guess progress is slow.
 
 In short, gproc in global mode doesn't seem to be a great solution at the moment, sadly.
 
@@ -398,6 +415,12 @@ The 'obvious' way -- and the only way this is possible in the process group mode
 
 For one thing, the connection process may not know what messages the end-user has received. It might be happily pushing messages over what it thinks is an active websocket, only for the websocket to die and the user to reconnect and say that they haven't received any messages since number 312 which was from 45 seconds ago. What do you do then?
 
+---
+
+### distributed scalability: connection state recovery
+
+???
+
 Maybe the connection process could keep the last (say) two minutes of messages, in a sort-of rolling message window, so it can handle that situation. Great. Except now go back to that example of having 10k subscribers to a channel on each node. Now 10k processes on that node each have to keep a copy of every message sent in the last two minutes on that channel. That's not gonna work.
 
 So lets try approach three:
@@ -452,9 +475,29 @@ This solves several problems with the previous approach:
 
 - each channel has a single point of synchronisation - the channelmaster - so we get we get the advantages of that - channel rules and so on.
 
-(This does mean that the channelmaster is a bottleneck for that channel, but that's ok, because the channel can be our unit of scalability. As it turns out, this solves a bunch of other scaling problems -- we don't need to think about how every feature scales, we just need to make it work within the limits of a channel, and make sure number of channels can scale. And if someone needs a per-channel message rate higher than one channel can sustain, they can always shard messages across multiple channels.
+---
 
---
+### approach 3: master-client; global process registration
+
+#### advantages:
+
+- efficient messaging fanout, channels can scale to many subscribers
+
+- each channel has a single point of synchronisation
+
+???
+
+(This does mean that the channelmaster is a bottleneck for that channel, but that's ok, because the channel can be our unit of scalability. This is actually a pretty useful thing to do -- to make a feature scale, we just need to make it scale within the limits of a channel, and make sure number of channels can scale. And if someone needs a per-channel message rate higher than one channel can sustain, they can always shard messages across multiple channels.
+
+---
+
+### approach 3: master-client; global process registration
+
+#### advantages:
+
+- efficient messaging fanout, channels can scale to many subscribers
+
+- each channel has a single point of synchronisation
 
 - connection state recovery window can live on the channel client
 
@@ -478,7 +521,7 @@ Having one client process per channel per node means that for connection state r
 
 Or even better, we can have it live in the channelmaster -- that way it's only in one place in the entire cluster. the channelclient can request a 'rewind' from the channelmaster as necessary.
 
-Why's that better? Because we want to be able to scale as close to linearly with number of nodes as possible -- we don't want a situation where the channelclients have to do/store so much that adding a new node to the cluster means it's already fully loaded with channelclient work before we add a single channelmaster to it.
+(Why's that better? Because we want to be able to scale as close to linearly with number of nodes as possible -- we don't want a situation where the channelclients have to do/store so much that adding a new node to the cluster means it's already fully loaded with channelclient work before we add a single channelmaster to it.)
 
 ---
 
@@ -561,6 +604,20 @@ That way you don't need any global process registration because the channelmaste
 
 It also means that when a new node is added, it automatically takes up a fair share of the work to be done in the cluster.
 
+---
+
+# approaches to pubsub in elixir
+
+1. .fade[keep subscription state in a process]
+
+2. .fade[property-based process registration]
+
+3. .fade[one 'master' process per channel, zero or one 'client' processes per channel per node, global process registration]
+
+4. one 'master' process per channel, zero or one 'client' processes per channel per node, hashing
+
+???
+
 Unfortunately, it means almost all the channelmasters have to move when you add or remove a node. If you scale up from 4 to 5 nodes and start taking the channel name hash modulo 5 instead of modulo 4, only a fifth of channels will be on the same node they were on before.
 
 This is solved with:
@@ -641,7 +698,7 @@ riak core.
 
 ???
 
-And with that , we seem to have resolved all the problems we had.
+This, finally, seems to address all our objections.
 
 So now lets look at what a basic pub/sub system in riak core might look like. Here's a half-finished and pretty rudimentary one I made earlier, which I called "ably-ng"
 
@@ -711,7 +768,7 @@ Source: Basho
 
 Here's that diagram of the riak core ring again. (I didn't mention at the time that it was the riak core ring specifically, but it is -- Basho are the company that make Riak).
 
-rather than having channelmasters live in some sense 'directly on the ring', riak uses an abstraction called a vnode, which stands for 'virtual node', which is basically just a small segment of the ring -- each of those individual little segments is a vnode.
+rather than having channelmasters live in some sense 'directly on the ring', riak uses an abstraction called a vnode -- 'virtual node', which is basically just a small segment of the ring -- each of those individual little segments is a vnode.
 
 Each erlang node will have several vnodes -- in that diagram, 8. The channelmasters live on the vnodes, the vnodes live on the ring.
 
@@ -725,7 +782,7 @@ Source: Basho
 
 This might seem like it complicates things, but it's actually a quite nice abstraction - it separates the job of 'knowing where I am on the ring' from the job of 'being a channelmaster'. So when the ring state changes, rather than all 100 thousand channels on the node having to work out if they need to relocate themselves, only the (say) 16 vnodes do that.
 
-The channelmasters still live on the ring in the sense that they have a hash, but that hash tells them which vnode they're on, and that never changes. When nodes are added and removed, the vnodes move around between them, but the channelmaster is always on the 'same' vnode.
+The channelmasters still live on the ring in the sense that they have a hash, but that hash just tells them which vnode they're on. When nodes are added and removed, the vnodes move around between them, but conceptually the channelmaster is always on the 'same' vnode.
 
 ---
 
@@ -1003,7 +1060,7 @@ end
 
 When a client sends this master command to it -- which is what the get_master function we were looking at before does -- it returns the pid of the master if one exists, or spawns a new one if not.
 
-Vnodes have a bunch of other callbacks to implement, for example some concerned with letting you run code at different stages of handoff, when vnodes migrate from one core to another.
+Vnodes have a bunch of other callbacks to implement, for example you define Vnode callbacks to run at different stages of of riak core calls hinted handoff, which is when vnodes migrate from one core to another, to pass data from the old to the new node, and make sure it happens without the channel losing continuity.
 
 ---
 
@@ -1036,7 +1093,7 @@ end
 
 ???
 
-And those are the main bits, really. Channelclients stay alive as long as one or more connections are attached to them. Channelmasters stay alive as long as they have one or more channelclients. Clients and channels can monitor each other with normal erlang process monitoring, so can get notifications if the other one dies (even if that's due to the whole node dying, erlang takes care of that for us).
+And those are the main bits, really. Channelclients stay alive as long as one or more connections are attached to them. Channelmasters stay alive as long as they have one or more channelclients. Clients and channels can monitor each other with normal erlang process monitoring, so can get notifications if the other one dies (even if that's due to the whole node dying).
 
 ---
 
