@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Title</title>
+    <meta charset="utf-8">
+    <style>
+      @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+      @import url(https://fonts.googleapis.com/css?family=Abel);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu);
+      @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+      body { font-family: 'sans-serif'; background-color: black;}
+      h1, h2, h3 {
+        font-family: 'Abel';
+        font-weight: normal;
+      }
+      .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono'; }
+
+      .small-caps { font-variant: small-caps }
+
+      .small { font-size: 70%; }
+
+      /* Thanks to http://www.partage-it.com/animez-vos-presentations-remark-js/  (in French) */
+      .remark-fading { z-index: 9; }
+      .remark-slide-container {transition: opacity 0.5s ease-out; opacity: 0;}
+      .remark-visible {transition: opacity 0.5s ease-out; opacity: 1;}
+
+      .ably > img { width: 80%; }
+      .lmars > img { width: 40%; }
+    </style>
+  </head>
+  <body>
+    <textarea id="source">
+
+class: center, middle
+
+# Heisenbug
+
+*/ˈhaɪzənˌbʌɡ/ (n)* A bug that disappears or alters its behavior when one attempts to probe or isolate it.
+
+*- The Jargon File*
+
+## Simon Woolf .small[&nbsp;&nbsp; simon@ably.io &nbsp;&nbsp; github.com/simonwoolf]
+
+--
+
+--
+
+???
+
+This is a debugging tale.
+
+As is often the case, the opening of the rabbit hole was small -- something that just doesn't _quite_ work as expected.
+
+---
+
+# .small-caps[It started] with a 500
+
+```sh
+$ curl http://eu-west-1-a-dev-translator-realtime.ably.io/nonexistantpath -v
+
+< HTTP/1.1 500 Internal Server Error
+* Server Cowboy is not blacklisted
+< server: Cowboy
+```
+
+???
+
+Getting an unknown path on a staging server was returning a 500 (internal server error), not a 404 (not found) error.
+
+But only in production (well - a staging cluster, but as far as the app knows, it's production). Not on my local machine, not in ci.
+
+This shouldn't happen as I have a 'catch-all' handler in the webserver I'm using that serves a nice 404. Which definitely works. It works locally, it has tests, and up until now it's worked in production.
+
+So I check the logs for that machine, and...
+
+---
+
+# The logfile:
+
+```sh
+
+```
+
+???
+
+They're empty.
+
+This shouldn't be possible. Anything which causes a 500 should prints an error log and a crash trace.
+
+For anyone not familiar with Elixir or Erlang: one of the guiding philosophies is that if something happens that you didn't anticipate, you 'let it crash'. The process -- an erlang term for a green thread -- handling that particular task dies, and if needed the process is restarted in a known good state by its supervisor. When this happens you get a crash report in the logs.
+
+So this is weird. I do the same thing a bunch more times, and suddenly:
+
+---
+
+# woah
+
+```erlang
+=INFO REPORT====
+    application: logger
+    exited: shutdown
+    type: permanent
+
+=ERROR REPORT====
+Error in process <0.438.0> with exit value:
+{[{reason,undef},
+  {mfa,{'Elixir.AppName.Web.CatchAll',handle,2}},
+  {stacktrace,
+      [{'Elixir.Inspect.List',inspect,
+           [[],
+            #{'__struct__' => 'Elixir.Inspect.Opts',
+              width => 80,
+              ...}],
+           []},
+       {'Elixir.Kernel',inspect,2,[{file,"lib/kernel.ex"},{line,1566}]},
+       {'Elixir.AppName.Web.CatchAll',handle,2,
+           [{file,"lib/web/catch_all.ex"},{line,11}]},
+           ...
+```
+
+???
+
+Aha.
+
+What's going on here?
+
+"application: logger,
+exited: shutdown".
+
+the logger's crashed!
+
+So that explains why I wasn't seeing anything -- the logger application must be responsible for flushing stdout; without that the logs were being buffered somewhere.
+
+OK, so, the module it crashed in my 404 handler.
+
+But the reason it crashed makes absolutely no sense. It's that inspect is undefined.
+
+The inspect function is part of the Elixir standard library, and is used to pretty-print data structures. There's no way it can be undefined.
+
+Here's the line it crashed on:
+
+---
+
+# the line it crashed on
+
+```elixir
+Logger.warn "Unknown path: #{:cowboy_req.path(request) |> elem(0)},
+  params: #{:cowboy_req.qs_vals(request) |> elem(0) |> inspect}"
+```
+
+???
+
+So the bit that crashed was literally equivalent to
+
+--
+
+```elixir
+inspect([])
+```
+
+???
+
+inspecting an empty list.
+
+Inspect definitely does work. On that same instance that was having the problem, I'm logging some info when the app starts, which uses inspect, and that  works fine.
+
+It's not inspecting any lists, admittedly.
+
+So I add something to app startup to just inspect and log an empty list to see what happens.
+
+And.. the bug disappears. Everything works fine.
+
+I take that away again, and it starts happening again. (sometimes -- not every time. that would be too easy).
+
+So it seems like this is only ever happening if the very first call to `inspect` for some datatype was done *from a webserver request handler process*, instead of just on app startup.
+
+So I could work around the problem by doing:
+
+---
+
+# Crazy workaround
+
+```elixir
+Logger.debug "Some data structures: \
+#{inspect {%{}, [], MapSet.new, 0.1, 1..2, ~r//, :a, <<1>>}}"
+```
+
+???
+
+this on app startup -- inspecting and logging a simple example of every datatype I can think of -- so that the first call to `inspect` with an array happens immediately, instead of in a web server request handler.
+
+This is crazy.
+
+---
+
+# Debugging results
+
+```elixir
+:erlang.function_exported(Elixir.Inspect.List, :inspect, 2)
+# => true locally
+# => false in production when the bug happens
+```
+
+???
+
+When it happens, the function is not available at runtime, but
+
+--
+
+- The `Elixir.Inspect.List.beam` file is present and correct
+
+???
+
+The physical file containing the compiled code for inspect is there in the slug -- I downloaded the slug and checked -- and it seems to have been compiled correctly. And
+
+---
+
+# Debugging
+
+- Sometimes, `Code.ensure_loaded?(Elixir.Inspect.List)` returns `true`. In this case:
+ - Subsequent `function_exported(Elixir.Inspect.List, :inspect, 2)` calls return `true`
+ - all subsequent `inspect` calls work correctly (whether List, Map, whatever). (After a successful `inspect` of a type, the relevant `function_exported` calls start returning true)
+
+- Sometimes, `Code.ensure_loaded?(Elixir.Inspect.List)` returns `false`. In this case:
+ - all `function_exported(Elixir.Inspect.List, :inspect, 2)` calls continue to return `false`
+ - all subsequent `inspect` calls fail (or if done by Logger, crash logger)
+
+???
+
+Code.ensure_loaded -- which loads a module if it isn't already -- just seems to behave completely randomly.
+
+And to be clear, this isn't just between builds, it's between deploys of a single build -- the same slug, the same compiled artifacts.
+
+Which seemed to indicate that maybe this was a bug in Erlang's code loader, which led to
+
+---
+
+# Debugging
+
+![scary labels](./scary-labels.png)
+
+???
+
+a github issue in the language's bug tracker with various scary labels.
+
+Eventually, with a lot of assistance from the incredibly helpful Elixir community, we figured out that the code being first run from a webserver request handler was a red herring. The reason that made a difference was just because if it ran on app startup, it was running _earlier_.
+
+Which lead to:
+
+---
+
+# The answer (tldr: it was our fault)
+
+???
+
+So before I jump into the answer, a quick explanation of how we deploy.
+
+our CI server compiles a 'slug', with everything needed to run the app, which we then copy to where where it's needed and mount it with overlayfs, which is a kind of filesysem that means that when the application tries to write something to the slug, it doesn't change the actual slug, but instead writes the changes to a separate 'upper' layer, that's then overlayed on top of the lower, slug layer.
+
+This upper directory is in /tmp, in a directory unique to each docker container instance.
+
+This means multiple independent docker containers can share the same slug at the same time; they can be redeployed and start from a clean state, and so on.
+
+The thing is,
+
+we have a maintenance script that runs *immediately after a deploy completes*, that among other things:
+
+---
+
+# The answer (tldr: it was our fault)
+
+```ruby
+if File.exists?('/tmp')
+  logger.info 'Cleaning up temp files older than 2 days'
+  warn 'Could not delete old temp files' unless system(
+    'sudo find /tmp -type f -mtime +2 -exec rm -f {} \;'
+  )
+end
+```
+
+???
+
+cleans up any files in /tmp with an mtime (last-modified time) of older than 2 day ago.
+
+Since the things in /tmp are these 'upper directories', this cleanup script didn't change the actual slug, so whenever I looked at that, it was all correct. But it did mark files as 'deleted' in overlayfs, so they were hidden from the docker container.
+
+Result: any BEAM files (compiled code) that had not yet been loaded by the erlang vm at the time the cleanup script ran were marked as deleted and so became inaccessible.
+
+(So the problem only showed up with inspect because all the other files and protocols were loaded and exercised earlier on, on app startup -- but, as it happens, not Inspect.List).
+
+---
+
+# Solution
+
+```diff
+  def slug_volume(slug_path)
+    # use an overlayfs mount so that the container cannot change files in the
+    # underlying slug directory
+-   tmp = Dir.mktmpdir("slug-")
+-   run "sudo mount -t overlayfs \
+-     -o lowerdir=#{slug_path},upperdir=#{tmp} overlayfs #{tmp}"
++   FileUtils.mkdir_p "/slugs/mnt"
++   mnt = Dir.mktmpdir("slug-", "/slugs/mnt")
++   run "sudo mount -t overlayfs \
++     -o lowerdir=#{slug_path},upperdir=#{mnt} overlayfs #{mnt}"
+    {
+-     host:  tmp,
++     host:  mnt,
+      guest: "/app"
+    }
+  end
+```
+
+???
+
+Solution: move the overlayfs upper directories out of /tmp.
+
+---
+
+class: center, middle
+
+# Thank you
+
+### Simon Woolf
+
+### simon@ably.io &nbsp;&nbsp;&nbsp; github.com/simonwoolf
+
+.ably[![Default-aligned image](./ably-banner.png)]
+
+
+    </textarea>
+    <script src="remark-latest.min.js">
+    </script>
+    <script>
+      var slideshow = remark.create({highlightStyle: 'github'});
+    </script>
+  </body>
+</html>
