@@ -51,14 +51,14 @@ class: center, middle
 
 This is a debugging tale.
 
-As is often the case, the opening of the rabbit hole was small -- something that just doesn't _quite_ work as expected.
+The mouth of the rabbit hole was small, as it often is. Something that just doesn't _quite_ work as expected.
 
 ---
 
 # .small-caps[It started] with a 500
 
 ```sh
-$ curl http://eu-west-1-a-dev-translator-realtime.ably.io/nonexistantpath -v
+$ curl http://staging-translator-realtime.ably.io/nonexistantpath -v
 
 < HTTP/1.1 500 Internal Server Error
 * Server Cowboy is not blacklisted
@@ -67,13 +67,13 @@ $ curl http://eu-west-1-a-dev-translator-realtime.ably.io/nonexistantpath -v
 
 ???
 
-Getting an unknown path on a staging server was returning a 500 (internal server error), not a 404 (not found) error.
+Getting an unknown path was returning a 500 (internal server error), not a 404 (not found) error.
 
-But only in production (well - a staging cluster, but as far as the app knows, it's production). Not on my local machine, not in ci.
+But only in production (or in this case, staging). Not on my local machine, not in ci.
 
 This shouldn't happen as I have a 'catch-all' handler in the webserver I'm using that serves a nice 404. Which definitely works. It works locally, it has tests, and up until now it's worked in production.
 
-So I check the logs for that machine, and...
+So I check the logs, and...
 
 ---
 
@@ -89,7 +89,7 @@ They're empty.
 
 This shouldn't be possible. Anything which causes a 500 should prints an error log and a crash trace.
 
-For anyone not familiar with Elixir or Erlang: one of the guiding philosophies is that if something happens that you didn't anticipate, you 'let it crash'. The process -- an erlang term for a green thread -- handling that particular task dies, and if needed the process is restarted in a known good state by its supervisor. When this happens you get a crash report in the logs.
+For anyone not familiar with Elixir or Erlang: one of the ideas is that if something happens that you didn't anticipate, you 'let it crash'. The process -- an erlang term for a green thread -- handling that particular task dies, and if needed the process is restarted in a known good state by its supervisor. When this happens you get a crash report in the logs.
 
 So this is weird. I do the same thing a bunch more times, and suddenly:
 
@@ -131,13 +131,13 @@ exited: shutdown".
 
 the logger's crashed!
 
-So that explains why I wasn't seeing anything -- the logger application must be responsible for flushing stdout; without that the logs were being buffered somewhere.
+I guess that explains why I wasn't seeing anything -- the logger application must be responsible for flushing stdout; without that the logs were being buffered somewhere.
 
 OK, so, the module it crashed in my 404 handler.
 
 But the reason it crashed makes absolutely no sense. It's that inspect is undefined.
 
-The inspect function is part of the Elixir standard library, and is used to pretty-print data structures. There's no way it can be undefined.
+The inspect function is part of the Elixir standard library, and is used to pretty-print data structures for debugging. There's no way it can be undefined.
 
 Here's the line it crashed on:
 
@@ -164,7 +164,7 @@ inspect([])
 
 inspecting an empty list.
 
-Inspect definitely does work. On that same instance that was having the problem, I'm logging some info when the app starts, which uses inspect, and that  works fine.
+Inspect definitely does work. On that same instance that was having the problem, I'm logging some info when the app starts, which uses inspect, and that works fine.
 
 It's not inspecting any lists, admittedly.
 
@@ -229,11 +229,11 @@ The physical file containing the compiled code for inspect is there in the slug 
 
 ???
 
-Code.ensure_loaded -- which loads a module if it isn't already -- just seems to behave completely randomly.
+now I'm getting deep into weird debugging -- Code.ensure_loaded -- which loads a module if it isn't already -- just seems to behave completely randomly.
 
 And to be clear, this isn't just between builds, it's between deploys of a single build -- the same slug, the same compiled artifacts.
 
-Which seemed to indicate that maybe this was a bug in Erlang's code loader, which led to
+So does that mean this like a bug in the language runtime itself, in Erlang's code loader? So now I have
 
 ---
 
@@ -247,7 +247,7 @@ a github issue in the language's bug tracker with various scary labels.
 
 Eventually, with a lot of assistance from the incredibly helpful Elixir community, we figured out that the code being first run from a webserver request handler was a red herring. The reason that made a difference was just because if it ran on app startup, it was running _earlier_.
 
-Which lead to:
+Which led to:
 
 ---
 
@@ -255,7 +255,7 @@ Which lead to:
 
 ???
 
-So before I jump into the answer, a quick explanation of how we deploy.
+So before I give you the answer, a bit of background on how we deploy.
 
 our CI server compiles a 'slug', with everything needed to run the app, which we then copy to where where it's needed and mount it with overlayfs, which is a kind of filesysem that means that when the application tries to write something to the slug, it doesn't change the actual slug, but instead writes the changes to a separate 'upper' layer, that's then overlayed on top of the lower, slug layer.
 
@@ -282,7 +282,7 @@ end
 
 ???
 
-cleans up any files in /tmp with an mtime (last-modified time) of older than 2 day ago.
+cleans up any files in /tmp with a last-modified time of older than 2 day ago.
 
 Since the things in /tmp are these 'upper directories', this cleanup script didn't change the actual slug, so whenever I looked at that, it was all correct. But it did mark files as 'deleted' in overlayfs, so they were hidden from the docker container.
 
